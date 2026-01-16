@@ -358,6 +358,11 @@ def vqe_ground_energy(
 		print("VQE parameter update norm: n/a")
 
 	_summarize_energy_trace(energy_trace)
+	try:
+		result.energy_trace = list(energy_trace)
+		result.initial_energy = initial_energy
+	except Exception:
+		pass
 	return energy, result
 
 

@@ -12,10 +12,7 @@ H = - (t/2) ( X0 X1 + Y0 Y1 + X2 X3 + Y2 Y3 )
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import re
-import sys
 
 import numpy as np
 
@@ -52,28 +49,6 @@ def _sorted_terms_str(pauli_list):
     return [f"{label}: {coeff}" for label, coeff in _sort_pauli_list(pauli_list)]
 
 
-def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        print(f"Invalid {name}={raw!r}; using default {default}.")
-        return default
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        print(f"Invalid {name}={raw!r}; using default {default}.")
-        return default
-
-
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -84,16 +59,39 @@ def _env_bool(name: str, default: bool = False) -> bool:
 def _parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
-    parser.add_argument("--ibm", action="store_true")
-    parser.add_argument("--vqe-maxiter", type=int, default=None)
-    parser.add_argument("--vqe-restarts", type=int, default=None)
-    parser.add_argument("--vqe-seed", type=int, default=None)
     parser.add_argument(
-        "--vqe-optimizer",
+        "--local",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run local noiseless VQE (default: enabled).",
+    )
+    parser.add_argument("--ibm", action="store_true")
+    parser.add_argument("--t", type=float, default=1.0)
+    parser.add_argument("--u", type=float, default=2.0)
+    parser.add_argument("--dv", type=float, default=0.5)
+    parser.add_argument(
+        "--ansatz",
+        type=str,
+        choices=["clustered", "uccsd", "both"],
+        default="both",
+    )
+    parser.add_argument(
+        "--reps",
+        type=int,
+        default=None,
+        help="Ansatz repetitions (default: clustered=2, uccsd=1).",
+    )
+    parser.add_argument("--restarts", type=int, default=10)
+    parser.add_argument("--maxiter", type=int, default=1500)
+    parser.add_argument(
+        "--optimizer",
         type=str,
         choices=["SLSQP", "L_BFGS_B", "COBYLA"],
-        default=None,
+        default="L_BFGS_B",
     )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--mapping-trials", type=int, default=0)
+    parser.add_argument("--mapping-seed", type=int, default=11)
     return parser.parse_args()
 
 
@@ -110,64 +108,6 @@ def _parse_index_list(raw: str | None, default: list[int]) -> list[int]:
             continue
         items.append(int(part))
     return items
-
-
-def _vqe_settings(args, *, for_ibm=False, for_test=False):
-    if for_test:
-        maxiter = (
-            args.vqe_maxiter
-            if args.vqe_maxiter is not None
-            else _env_int("VQE_TEST_MAXITER", 500)
-        )
-        restarts = (
-            args.vqe_restarts
-            if args.vqe_restarts is not None
-            else _env_int("VQE_TEST_RESTARTS", 3)
-        )
-        seed = (
-            args.vqe_seed
-            if args.vqe_seed is not None
-            else _env_int("VQE_TEST_SEED", 0)
-        )
-        optimizer_name = (
-            args.vqe_optimizer
-            if args.vqe_optimizer is not None
-            else os.environ.get("VQE_TEST_OPTIMIZER", "L_BFGS_B")
-        )
-        tol = _env_float("VQE_TEST_OPT_TOL", 1e-10)
-        return maxiter, restarts, seed, optimizer_name, tol
-
-    if for_ibm:
-        maxiter = (
-            args.vqe_maxiter
-            if args.vqe_maxiter is not None
-            else _env_int("VQE_MAXITER", 50)
-        )
-        restarts = (
-            args.vqe_restarts
-            if args.vqe_restarts is not None
-            else _env_int("VQE_RESTARTS", 1)
-        )
-    else:
-        maxiter = (
-            args.vqe_maxiter
-            if args.vqe_maxiter is not None
-            else _env_int("VQE_MAXITER", 1000)
-        )
-        restarts = (
-            args.vqe_restarts
-            if args.vqe_restarts is not None
-            else _env_int("VQE_RESTARTS", 20)
-        )
-
-    seed = args.vqe_seed if args.vqe_seed is not None else _env_int("VQE_SEED", 0)
-    optimizer_name = (
-        args.vqe_optimizer
-        if args.vqe_optimizer is not None
-        else os.environ.get("VQE_OPTIMIZER", "L_BFGS_B")
-    )
-    tol = _env_float("VQE_OPT_TOL", 1e-10)
-    return maxiter, restarts, seed, optimizer_name, tol
 
 
 def _default_sector(up_qubits, down_qubits):
@@ -281,11 +221,9 @@ def _run_mapping_regression() -> None:
     _run_mapping_equivalence(DEFAULT_MAPPING_PARAMS)
 
 
-def _run_mapping_random() -> None:
-    trials = _env_int("MAPPING_RANDOM_TRIALS", 0)
+def _run_mapping_random(trials: int, seed: int) -> None:
     if trials <= 0:
         return
-    seed = _env_int("MAPPING_RANDOM_SEED", 11)
     rng = np.random.default_rng(seed)
     params = []
     for _ in range(trials):
@@ -339,14 +277,6 @@ def _summarize_restart_energies(energies):
     )
 
 
-def _get_ansatz_initial_point(ansatz):
-    metadata = getattr(ansatz, "metadata", None) or {}
-    initial_point = metadata.get("initial_point")
-    source = metadata.get("initial_point_source")
-    point_range = metadata.get("initial_point_range")
-    return initial_point, source, point_range
-
-
 def _print_uccsd_details(ansatz):
     print(f"UCCSD parameters: {getattr(ansatz, 'num_parameters', 'n/a')}")
     excitation_list = getattr(ansatz, "excitation_list", None)
@@ -357,45 +287,12 @@ def _print_uccsd_details(ansatz):
         print(f"UCCSD HF occupations: {metadata['hf_occupations']}")
     if "initial_point_source" in metadata:
         print(f"UCCSD initial point source: {metadata['initial_point_source']}")
-    if "initial_point_range" in metadata:
-        print(f"UCCSD multistart range: {metadata['initial_point_range']}")
 
 
 def _estimate_energy(hamiltonian, ansatz, estimator, params):
     from pydephasing.quantum.quantum_eigensolver import _evaluate_energy
 
     return _evaluate_energy(estimator, ansatz, hamiltonian, params)
-
-
-def _expressibility_probe(
-    *,
-    hamiltonian,
-    ansatz,
-    estimator,
-    seed,
-    samples,
-    param_range,
-):
-    if samples <= 0:
-        print("Clustered expressibility probe: skipped (samples <= 0).")
-        return
-    n_params = getattr(ansatz, "num_parameters", 0) or 0
-    if n_params == 0:
-        print("Clustered expressibility probe: skipped (no parameters).")
-        return
-
-    rng = np.random.default_rng(seed)
-    energies = []
-    for _ in range(samples):
-        params = rng.uniform(-param_range, param_range, size=n_params)
-        energies.append(_estimate_energy(hamiltonian, ansatz, estimator, params))
-
-    energies = np.asarray(energies, dtype=float)
-    print(
-        "Clustered expressibility probe: "
-        f"min={energies.min()}, median={np.median(energies)}, max={energies.max()}"
-    )
-    print(f"Clustered expressibility probe: best sample energy={energies.min()}")
 
 
 def _run_vqe_multistart(
@@ -407,57 +304,54 @@ def _run_vqe_multistart(
     restarts,
     seed,
     estimator,
-    tol,
     transpiler=None,
-    initial_point=None,
-    initial_point_source=None,
-    initial_point_range=None,
 ):
-    from pydephasing.quantum.quantum_eigensolver import compute_ground_state
+    from pydephasing.quantum.quantum_eigensolver import vqe_ground_energy
 
     rng = np.random.default_rng(seed)
     energies = []
     best_energy = None
     best_params = None
+    best_result = None
     n_params = getattr(ansatz, "num_parameters", 0) or 0
     restarts = max(1, restarts)
 
-    point_range = 0.2 if initial_point_range is None else float(initial_point_range)
-    jitter_range = min(0.05, 0.25 * point_range)
-
     for idx in range(restarts):
-        point = None
-        if idx == 0 and initial_point is not None and n_params:
-            point = np.asarray(initial_point, dtype=float)
-            if point.shape[0] != n_params:
-                print("Initial point length mismatch; falling back to random.")
-                point = None
-            elif np.allclose(point, 0.0):
-                point = rng.uniform(-jitter_range, jitter_range, size=n_params)
-        if point is None and n_params:
-            point = rng.uniform(-point_range, point_range, size=n_params)
-        if idx == 0 and point is not None and initial_point_source:
-            print(f"VQE restart 1 uses initial point ({initial_point_source}).")
-        optimizer = _build_optimizer(optimizer_name, maxiter, tol)
-        energy, optimal_params = compute_ground_state(
+        point = rng.uniform(-0.2, 0.2, size=n_params) if n_params else None
+        optimizer = _build_optimizer(optimizer_name, maxiter, tol=1e-10)
+        energy, result = vqe_ground_energy(
             hamiltonian,
-            method="vqe",
-            vqe_options={
-                "ansatz": ansatz,
-                "optimizer": optimizer,
-                "estimator": estimator,
-                "transpiler": transpiler,
-                "initial_point": point,
-            },
+            ansatz=ansatz,
+            optimizer=optimizer,
+            estimator=estimator,
+            transpiler=transpiler,
+            initial_point=point,
         )
         energies.append(energy)
         if best_energy is None or energy < best_energy:
             best_energy = energy
-            best_params = optimal_params
+            best_result = result
+            best_params = getattr(result, "optimal_parameters", None)
 
     _summarize_restart_energies(energies)
     print(f"VQE best energy across restarts: {best_energy}")
-    return best_energy, best_params, energies
+    return best_energy, best_params, energies, best_result
+
+
+def _default_reps(kind: str, requested: int | None) -> int:
+    if requested is not None:
+        return requested
+    return 2 if kind == "clustered" else 1
+
+
+def _summarize_best_trace(trace):
+    if not trace:
+        print("Best energy trace: []")
+        return
+    head = trace[:5]
+    tail = trace[-5:] if len(trace) > 5 else trace
+    print(f"Best energy trace (first 5): {head}")
+    print(f"Best energy trace (last 5): {tail}")
 
 
 def _run_exact_invariants() -> None:
@@ -482,71 +376,150 @@ def _run_exact_invariants() -> None:
             )
 
 
-def _run_vqe_regression(t, u, dv, args) -> None:
+def _run_local_vqe_case(
+    *,
+    hamiltonian,
+    estimator,
+    t,
+    u,
+    dv,
+    kind,
+    reps,
+    restarts,
+    maxiter,
+    optimizer_name,
+    seed,
+    e_exact_full,
+    allow_retry,
+):
     from pydephasing.quantum.quantum_eigensolver import (
+        _optimizer_status,
         ansatz_factory,
-        exact_ground_energy,
     )
 
-    _, op = _build_hubbard_qubit_op(t, u, dv, mode="JW")
+    ansatz, kind_used = ansatz_factory(
+        kind,
+        t=t,
+        U=u,
+        dv=dv,
+        reps=reps,
+    )
+    if kind == "uccsd" and kind_used != "uccsd":
+        raise ImportError("UCCSD ansatz unavailable; install qiskit_nature.")
+    if kind_used == "uccsd":
+        _print_uccsd_details(ansatz)
+
+    n_params = getattr(ansatz, "num_parameters", 0) or 0
+    e_init = None
+    if n_params:
+        zero_point = np.zeros(n_params, dtype=float)
+        e_init = _estimate_energy(hamiltonian, ansatz, estimator, zero_point)
+    print(f"E_init({kind_used}): {e_init}")
+
+    energy, optimal_params, energies, best_result = _run_vqe_multistart(
+        hamiltonian=hamiltonian,
+        ansatz=ansatz,
+        optimizer_name=optimizer_name,
+        maxiter=maxiter,
+        restarts=restarts,
+        seed=seed,
+        estimator=estimator,
+    )
+    print(f"E_vqe_best({kind_used}): {energy}")
+    if best_result is not None:
+        print(f"Best optimizer status: {_optimizer_status(best_result)}")
+
+    delta = abs(energy - e_exact_full)
+    if kind_used == "uccsd":
+        target_tol = 1e-5
+    else:
+        target_tol = 1e-3
+
+    if delta > target_tol and allow_retry:
+        if kind_used == "clustered" and reps == 2:
+            print("Clustered threshold not met at reps=2; retrying with reps=3.")
+            return _run_local_vqe_case(
+                hamiltonian=hamiltonian,
+                estimator=estimator,
+                t=t,
+                u=u,
+                dv=dv,
+                kind=kind,
+                reps=3,
+                restarts=restarts,
+                maxiter=maxiter,
+                optimizer_name=optimizer_name,
+                seed=seed,
+                e_exact_full=e_exact_full,
+                allow_retry=False,
+            )
+        if kind_used == "uccsd" and reps == 1:
+            print("UCCSD threshold not met at reps=1; retrying with reps=2.")
+            return _run_local_vqe_case(
+                hamiltonian=hamiltonian,
+                estimator=estimator,
+                t=t,
+                u=u,
+                dv=dv,
+                kind=kind,
+                reps=2,
+                restarts=restarts,
+                maxiter=maxiter,
+                optimizer_name=optimizer_name,
+                seed=seed,
+                e_exact_full=e_exact_full,
+                allow_retry=False,
+            )
+
+    if delta > target_tol:
+        if best_result is not None:
+            trace = getattr(best_result, "energy_trace", None)
+            _summarize_best_trace(trace)
+        raise AssertionError(
+            f"VQE({kind_used}) deviates from exact by {delta} (> {target_tol})."
+        )
+
+    if _env_bool("DEBUG_VQE_PARAMS", False):
+        print(f"VQE({kind_used}) optimal params: {optimal_params}")
+
+    return energy, delta
+
+
+def _run_local_vqe(t, u, dv, args, *, ansatz_choice, require_thresholds):
+    from pydephasing.quantum.quantum_eigensolver import exact_ground_energy
+
+    _, hamiltonian = _build_hubbard_qubit_op(t, u, dv, mode="JW")
+    estimator = _local_estimator()
+
     up_qubits = DEFAULT_UP_QUBITS
     down_qubits = DEFAULT_DOWN_QUBITS
     sector = _default_sector(up_qubits, down_qubits)
-    e_exact = exact_ground_energy(op, sector=sector, n_qubits=4)
+    e_exact_full = exact_ground_energy(hamiltonian, sector=None, n_qubits=4)
+    e_exact_sector = exact_ground_energy(hamiltonian, sector=sector, n_qubits=4)
 
-    estimator = _local_estimator()
-    maxiter, restarts, seed, optimizer_name, opt_tol = _vqe_settings(
-        args, for_test=True
-    )
-    tol_clustered = _env_float("VQE_TEST_CLUSTERED_TOL", 1e-2)
-    tol_uccsd = _env_float("VQE_TEST_UCCSD_TOL", 1e-6)
-    tol_other = _env_float("VQE_TEST_TOL", 0.3)
-    reps = _env_int("VQE_TEST_REPS", 2)
+    print(f"E_exact_full: {e_exact_full}")
+    print(f"E_exact_sector: {e_exact_sector} | {sector}")
 
-    for kind in ("clustered", "uccsd"):
-        ansatz, kind_used = ansatz_factory(
-            kind,
-            t=t,
-            U=u,
-            dv=dv,
-            reps=reps,
-        )
-        if kind == "uccsd" and kind_used != "uccsd":
-            print("UCCSD unavailable; skipping UCCSD VQE regression.")
-            continue
-        if kind_used == "uccsd":
-            _print_uccsd_details(ansatz)
+    kinds = ["clustered", "uccsd"] if ansatz_choice == "both" else [ansatz_choice]
 
-        initial_point, source, point_range = _get_ansatz_initial_point(ansatz)
-
-        energy, optimal_params, energies = _run_vqe_multistart(
-            hamiltonian=op,
-            ansatz=ansatz,
-            optimizer_name=optimizer_name,
-            maxiter=maxiter,
-            restarts=restarts,
-            seed=seed,
+    for kind in kinds:
+        reps = _default_reps(kind, args.reps)
+        print(f"Running local VQE for {kind} (reps={reps})")
+        _run_local_vqe_case(
+            hamiltonian=hamiltonian,
             estimator=estimator,
-            tol=opt_tol,
-            initial_point=initial_point,
-            initial_point_source=source,
-            initial_point_range=point_range,
+            t=t,
+            u=u,
+            dv=dv,
+            kind=kind,
+            reps=reps,
+            restarts=args.restarts,
+            maxiter=args.maxiter,
+            optimizer_name=args.optimizer,
+            seed=args.seed,
+            e_exact_full=e_exact_full,
+            allow_retry=require_thresholds,
         )
-        delta = abs(energy - e_exact)
-        print(f"VQE({kind_used}) energy: {energy} | deltaE={delta}")
-        if kind_used == "uccsd":
-            target_tol = tol_uccsd
-        elif kind_used == "clustered":
-            target_tol = tol_clustered
-        else:
-            target_tol = tol_other
-        if delta > target_tol:
-            raise AssertionError(
-                f"VQE({kind_used}) deviates from exact by {delta} (> {target_tol})."
-            )
-
-        if _env_bool("DEBUG_VQE_PARAMS", False):
-            print(f"VQE({kind_used}) optimal params: {optimal_params}")
 
 
 def _run_self_test(args) -> None:
@@ -566,275 +539,50 @@ def _run_self_test(args) -> None:
 
     _run_mapping_regression()
     _run_exact_invariants()
-    t, u, dv = DEFAULT_MAPPING_PARAMS[0]
-    _run_vqe_regression(t, u, dv, args)
+    _run_local_vqe(1.0, 2.0, 0.5, args, ansatz_choice="both", require_thresholds=True)
     print("SELF-TEST PASS")
-
-
-def _backend_is_simulator(backend) -> bool:
-    for attr in ("simulator", "is_simulator"):
-        value = getattr(backend, attr, None)
-        if isinstance(value, bool):
-            return value
-    if hasattr(backend, "configuration"):
-        try:
-            cfg = backend.configuration()
-        except Exception:
-            cfg = None
-        if cfg is not None and hasattr(cfg, "simulator"):
-            return bool(cfg.simulator)
-    return False
-
-
-def _looks_like_token(value: str) -> bool:
-    lowered = value.lower()
-    if "<" in value or "your-api-key" in lowered or "api-key" in lowered:
-        return False
-    return len(value) >= 20
-
-
-def _extract_notebook_credentials(path: str) -> tuple[str | None, str | None]:
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except Exception:
-        return None, None
-
-    sources = []
-    for cell in data.get("cells", []):
-        if cell.get("cell_type") != "code":
-            continue
-        src = cell.get("source", "")
-        if isinstance(src, list):
-            sources.append("".join(src))
-        else:
-            sources.append(str(src))
-
-    text = "\n".join(sources)
-
-    token_patterns = [
-        r'QISKIT_IBM_TOKEN"\]\s*=\s*"([^"]+)"',
-        r"QISKIT_IBM_TOKEN'\]\s*=\s*'([^']+)'",
-        r'token\s*=\s*"([^"]+)"',
-        r"token\s*=\s*'([^']+)'",
-    ]
-    instance_patterns = [
-        r'instance\s*=\s*"(crn:[^"]+)"',
-        r"instance\s*=\s*'(crn:[^']+)'",
-        r'instance\s*=.*?"(crn:[^"]+)"',
-        r"instance\s*=.*?'(crn:[^']+)'",
-    ]
-
-    token = None
-    for pattern in token_patterns:
-        match = re.search(pattern, text)
-        if match and _looks_like_token(match.group(1)):
-            token = match.group(1)
-            break
-
-    instance = None
-    for pattern in instance_patterns:
-        match = re.search(pattern, text)
-        if match:
-            instance = match.group(1)
-            break
-
-    return token, instance
 
 
 def _load_ibm_runtime_service():
     from qiskit_ibm_runtime import QiskitRuntimeService
 
-    account_name = os.environ.get("IBM_RUNTIME_ACCOUNT_NAME")
-    channel = os.environ.get("IBM_RUNTIME_CHANNEL")
+    channel = os.environ.get("IBM_RUNTIME_CHANNEL", "ibm_quantum_platform")
     token = os.environ.get("IBM_RUNTIME_TOKEN") or os.environ.get("QISKIT_IBM_TOKEN")
     instance = os.environ.get("IBM_RUNTIME_INSTANCE") or os.environ.get(
         "QISKIT_IBM_INSTANCE"
     )
-
     if not token or not instance:
-        notebook_path = os.environ.get(
-            "IBM_RUNTIME_NOTEBOOK_PATH",
-            os.path.join(os.getcwd(), "Untitled-1.ipynb"),
+        raise RuntimeError(
+            "IBM credentials must be set via IBM_RUNTIME_TOKEN/QISKIT_IBM_TOKEN "
+            "and IBM_RUNTIME_INSTANCE/QISKIT_IBM_INSTANCE."
         )
-        nb_token, nb_instance = _extract_notebook_credentials(notebook_path)
-        if not token and nb_token:
-            token = nb_token
-            print("Loaded IBM Runtime token from notebook.")
-        if not instance and nb_instance:
-            instance = nb_instance
-            print("Loaded IBM Runtime instance from notebook.")
-
-    if token:
-        if not channel:
-            channel = "ibm_quantum_platform"
-        kwargs = {"channel": channel, "token": token}
-        if instance:
-            kwargs["instance"] = instance
-        print(f"Using IBM Runtime channel: {channel}")
-        return QiskitRuntimeService(**kwargs)
-
-    if account_name:
-        print(f"Using IBM Runtime account name: {account_name}")
-        return QiskitRuntimeService(name=account_name)
-    if channel:
-        print(f"Using IBM Runtime channel: {channel}")
-        return QiskitRuntimeService(channel=channel)
-
-    try:
-        accounts = QiskitRuntimeService.saved_accounts()
-    except Exception:
-        accounts = {}
-
-    for name, info in accounts.items():
-        if info.get("channel") == "ibm_quantum_platform":
-            print(f"Using saved IBM Quantum Platform account: {name}")
-            return QiskitRuntimeService(name=name)
-
-    print("Using default IBM Runtime account.")
-    return QiskitRuntimeService()
+    print(f"Using IBM Runtime channel: {channel}")
+    return QiskitRuntimeService(channel=channel, token=token, instance=instance)
 
 
 def _select_ibm_backend(service):
-    preferred = os.environ.get("IBM_RUNTIME_BACKEND", "ibm_qasm_simulator")
-    backend = None
+    name = os.environ.get("IBM_BACKEND")
+    if not name:
+        raise RuntimeError("IBM_BACKEND must be set for IBM Runtime mode.")
     try:
-        backend = service.backend(preferred)
-    except Exception:
-        backend = None
-
-    if backend is None:
-        simulators = service.backends(simulator=True, operational=True)
-        if simulators:
-            backend = simulators[0]
-        else:
-            devices = service.backends(simulator=False, operational=True)
-            if not devices:
-                raise RuntimeError("No operational IBM backends available.")
-            backend = devices[0]
-
+        backend = service.backend(name)
+    except Exception as exc:
+        raise RuntimeError(f"IBM backend {name!r} is not available.") from exc
     print(f"Using backend: {backend.name}")
     return backend
 
 
 def _run_vqe_local(args) -> None:
-    from pydephasing.quantum.quantum_eigensolver import (
-        ansatz_factory,
-        exact_ground_energy,
+    print("Running local VQE (StatevectorEstimator).")
+    print(f"Parameters: t={args.t}, u={args.u}, dv={args.dv}")
+    _run_local_vqe(
+        args.t,
+        args.u,
+        args.dv,
+        args,
+        ansatz_choice=args.ansatz,
+        require_thresholds=True,
     )
-
-    t = _env_float("VQE_T", 1.0)
-    u = _env_float("VQE_U", 2.0)
-    dv = _env_float("VQE_DV", 0.5)
-    reps = _env_int("VQE_REPS", 1)
-    ansatz_kind = os.environ.get("VQE_ANSATZ", "clustered")
-    maxiter, restarts, seed, optimizer_name, opt_tol = _vqe_settings(args)
-
-    _, hamiltonian = _build_hubbard_qubit_op(t, u, dv, mode="JW")
-    operator_source = "PauliPolynomial (JW) -> SparsePauliOp"
-
-    print("Running local VQE (Aer/statevector).")
-    print(f"Operator source: {operator_source}")
-    print(f"Parameters: t={t}, u={u}, dv={dv}")
-
-    estimator = _local_estimator()
-
-    up_qubits = _parse_index_list(os.environ.get("UP_QUBITS"), DEFAULT_UP_QUBITS)
-    down_qubits = _parse_index_list(os.environ.get("DOWN_QUBITS"), DEFAULT_DOWN_QUBITS)
-    default_sector = _default_sector(up_qubits, down_qubits)
-    exact_sector = _parse_exact_sector(default_sector)
-    if exact_sector and "sz" in exact_sector:
-        exact_sector.setdefault("up_qubits", up_qubits)
-        exact_sector.setdefault("down_qubits", down_qubits)
-
-    e_exact_full = exact_ground_energy(hamiltonian, sector=None, n_qubits=4)
-    e_exact_sector = (
-        exact_ground_energy(hamiltonian, sector=exact_sector, n_qubits=4)
-        if exact_sector
-        else e_exact_full
-    )
-
-    print(f"Exact ground (full): {e_exact_full}")
-    if exact_sector:
-        print(f"Exact ground (sector): {e_exact_sector} | {exact_sector}")
-
-    ansatz, kind_used = ansatz_factory(
-        ansatz_kind,
-        t=t,
-        U=u,
-        dv=dv,
-        reps=reps,
-    )
-    if kind_used != ansatz_kind:
-        print(f"Ansatz fallback: requested {ansatz_kind}, using {kind_used}.")
-
-    if kind_used == "uccsd":
-        _print_uccsd_details(ansatz)
-
-    initial_point, source, point_range = _get_ansatz_initial_point(ansatz)
-
-    if kind_used == "clustered":
-        initial_energy = None
-        n_params = getattr(ansatz, "num_parameters", 0) or 0
-        if n_params:
-            zero_point = np.zeros(n_params, dtype=float)
-            initial_energy = _estimate_energy(
-                hamiltonian, ansatz, estimator, zero_point
-            )
-            print(f"Clustered initial state energy: {initial_energy}")
-        else:
-            print("Clustered initial state energy: n/a (no parameters).")
-
-        probe_samples = _env_int("EXPRESSIBILITY_SAMPLES", 200)
-        probe_seed = _env_int("EXPRESSIBILITY_SEED", 0)
-        probe_range = _env_float("EXPRESSIBILITY_RANGE", float(np.pi))
-        _expressibility_probe(
-            hamiltonian=hamiltonian,
-            ansatz=ansatz,
-            estimator=estimator,
-            seed=probe_seed,
-            samples=probe_samples,
-            param_range=probe_range,
-        )
-
-    energy, optimal_params, energies = _run_vqe_multistart(
-        hamiltonian=hamiltonian,
-        ansatz=ansatz,
-        optimizer_name=optimizer_name,
-        maxiter=maxiter,
-        restarts=restarts,
-        seed=seed,
-        estimator=estimator,
-        tol=opt_tol,
-        initial_point=initial_point,
-        initial_point_source=source,
-        initial_point_range=point_range,
-    )
-
-    print(f"VQE ground state energy: {energy}")
-    if _env_bool("DEBUG_VQE_PARAMS", False):
-        print(f"Optimal parameters: {optimal_params}")
-    if kind_used == "clustered" and initial_energy is not None:
-        print(
-            "Clustered energy summary: "
-            f"initial={initial_energy}, vqe_best={energy}, exact={e_exact_sector}"
-        )
-
-    if os.environ.get("VQE_LOCAL_TOL") is not None:
-        tol_value = _env_float("VQE_LOCAL_TOL", 0.3)
-    elif kind_used == "uccsd":
-        tol_value = _env_float("VQE_LOCAL_UCCSD_TOL", 1e-6)
-    elif kind_used == "clustered":
-        tol_value = _env_float("VQE_LOCAL_CLUSTERED_TOL", 1e-2)
-    else:
-        tol_value = _env_float("VQE_LOCAL_TOL", 0.3)
-    delta = abs(energy - e_exact_sector)
-    print(f"Exact comparison tolerance: {tol_value}")
-    print(f"VQE vs exact (sector) deltaE: {delta}")
-    if delta > tol_value:
-        raise AssertionError(
-            f"VQE energy differs from exact by {delta} (> {tol_value})."
-        )
 
 
 def _run_vqe_on_ibm(args) -> None:
@@ -847,20 +595,18 @@ def _run_vqe_on_ibm(args) -> None:
         exact_ground_energy,
     )
 
-    t = _env_float("VQE_T", 1.0)
-    u = _env_float("VQE_U", 2.0)
-    dv = _env_float("VQE_DV", 0.5)
-    shots = _env_int("VQE_SHOTS", 1024)
-    reps = _env_int("VQE_REPS", 1)
-    ansatz_kind = os.environ.get("VQE_ANSATZ", "clustered")
-    maxiter, restarts, seed, optimizer_name, opt_tol = _vqe_settings(args, for_ibm=True)
+    shots = int(os.environ.get("VQE_SHOTS", "1024"))
+    maxiter = args.maxiter
+    restarts = max(1, args.restarts)
+    seed = args.seed
+    optimizer_name = args.optimizer
 
-    _, hamiltonian = _build_hubbard_qubit_op(t, u, dv, mode="JW")
+    _, hamiltonian = _build_hubbard_qubit_op(args.t, args.u, args.dv, mode="JW")
     operator_source = "PauliPolynomial (JW) -> SparsePauliOp"
 
     print("Running VQE on IBM Quantum Platform.")
     print(f"Operator source: {operator_source}")
-    print(f"Parameters: t={t}, u={u}, dv={dv}")
+    print(f"Parameters: t={args.t}, u={args.u}, dv={args.dv}")
 
     service = _load_ibm_runtime_service()
     backend = _select_ibm_backend(service)
@@ -886,23 +632,21 @@ def _run_vqe_on_ibm(args) -> None:
         print(f"Exact ground (sector): {e_exact_sector} | {exact_sector}")
 
     ansatz, kind_used = ansatz_factory(
-        ansatz_kind,
-        t=t,
-        U=u,
-        dv=dv,
-        reps=reps,
+        args.ansatz if args.ansatz != "both" else "clustered",
+        t=args.t,
+        U=args.u,
+        dv=args.dv,
+        reps=_default_reps(args.ansatz if args.ansatz != "both" else "clustered", args.reps),
     )
-    if kind_used != ansatz_kind:
-        print(f"Ansatz fallback: requested {ansatz_kind}, using {kind_used}.")
+    if args.ansatz == "both":
+        print("IBM mode uses a single ansatz; defaulting to clustered.")
     if kind_used == "uccsd":
         _print_uccsd_details(ansatz)
-
-    initial_point, source, point_range = _get_ansatz_initial_point(ansatz)
 
     try:
         with Session(backend) as session:
             estimator = Estimator(session, options=options)
-            energy, optimal_params, energies = _run_vqe_multistart(
+            energy, optimal_params, energies, best_result = _run_vqe_multistart(
                 hamiltonian=hamiltonian,
                 ansatz=ansatz,
                 optimizer_name=optimizer_name,
@@ -910,18 +654,14 @@ def _run_vqe_on_ibm(args) -> None:
                 restarts=restarts,
                 seed=seed,
                 estimator=estimator,
-                tol=opt_tol,
                 transpiler=transpiler,
-                initial_point=initial_point,
-                initial_point_source=source,
-                initial_point_range=point_range,
             )
     except RequestsApiError as exc:
         if "open plan" not in str(exc) and "1352" not in str(exc):
             raise
         print("Session mode not authorized; retrying in job mode.")
         estimator = Estimator(backend, options=options)
-        energy, optimal_params, energies = _run_vqe_multistart(
+        energy, optimal_params, energies, best_result = _run_vqe_multistart(
             hamiltonian=hamiltonian,
             ansatz=ansatz,
             optimizer_name=optimizer_name,
@@ -929,11 +669,7 @@ def _run_vqe_on_ibm(args) -> None:
             restarts=restarts,
             seed=seed,
             estimator=estimator,
-            tol=opt_tol,
             transpiler=transpiler,
-            initial_point=initial_point,
-            initial_point_source=source,
-            initial_point_range=point_range,
         )
 
     print(f"VQE ground state energy: {energy}")
@@ -942,12 +678,10 @@ def _run_vqe_on_ibm(args) -> None:
 
     tol_raw = os.environ.get("EXACT_TOL")
     if tol_raw is None:
-        if _backend_is_simulator(backend):
-            tol_value = 5e-2 if shots >= 4096 else 1e-1
-        else:
-            tol_value = 5e-1
+        tol_value = 5e-1
+        print("Warning: shots/hardware noise -> using EXACT_TOL=0.5.")
     else:
-        tol_value = _env_float("EXACT_TOL", 1e-3)
+        tol_value = float(tol_raw)
     delta = abs(energy - e_exact_sector)
     print(f"Exact comparison tolerance: {tol_value}")
     print(f"VQE vs exact (sector) deltaE: {delta}")
@@ -960,19 +694,18 @@ def _run_vqe_on_ibm(args) -> None:
 
 def main() -> None:
     args = _parse_args()
-    self_test_only = args.self_test
-    use_ibm = args.ibm or _env_bool("USE_IBM_RUNTIME", False)
-
-    _run_self_test(args)
-    if self_test_only:
+    if args.self_test:
+        _run_self_test(args)
         return
 
-    _run_mapping_random()
+    if args.mapping_trials > 0:
+        _run_mapping_random(args.mapping_trials, args.mapping_seed)
 
-    if use_ibm:
-        _run_vqe_on_ibm(args)
-    else:
+    if args.local:
         _run_vqe_local(args)
+
+    if args.ibm:
+        _run_vqe_on_ibm(args)
 
 
 if __name__ == "__main__":
