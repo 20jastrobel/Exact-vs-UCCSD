@@ -1,1 +1,3 @@
-__version__ = '1.0.0'
+"""pydephasing package."""
+
+__version__ = "1.0.0"

@@ -32,3 +32,5 @@ utils/__pycache__/
 *.pyc
 pydeph
 petsc
+# Local notebooks and secrets
+Untitled-1.ipynb
