@@ -8,7 +8,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Iterable, Optional, Sequence
+from typing import Dict, Iterable, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from qiskit.circuit import QuantumCircuit
@@ -43,6 +43,9 @@ class LocalVQEResult:
     seconds: float
 
 
+Edge = Union[Tuple[int, int], Tuple[int, int, complex]]
+
+
 def _str_to_bool(value: str) -> bool:
     if isinstance(value, bool):
         return value
@@ -70,7 +73,119 @@ def _normalize_ansatz(name: str) -> str:
     return name
 
 
-def build_fermionic_hubbard(t: float, u: float, dv: float) -> FermionicOp:
+def _spin_orbital_index(site: int, spin: int, n_sites: int) -> int:
+    if site < 0 or site >= n_sites:
+        raise ValueError(f"site out of range: {site} (n_sites={n_sites})")
+    if spin not in (0, 1):
+        raise ValueError(f"spin must be 0(up) or 1(down), got {spin}")
+    return site + spin * n_sites
+
+
+def _add_term(data: Dict[str, complex], label: str, coeff: complex, *, atol: float = 0.0) -> None:
+    if atol and abs(coeff) <= atol:
+        return
+    data[label] = data.get(label, 0.0) + coeff
+    if atol and abs(data[label]) <= atol:
+        data.pop(label, None)
+
+
+def _normalize_onsite_potential(
+    v: Optional[Union[Sequence[float], Sequence[Sequence[float]]]],
+    n_sites: int,
+) -> np.ndarray:
+    if v is None:
+        return np.zeros((n_sites, 2), dtype=float)
+
+    arr = np.asarray(v, dtype=float)
+    if arr.ndim == 1:
+        if arr.shape[0] != n_sites:
+            raise ValueError(f"v must have length n_sites={n_sites}, got {arr.shape[0]}")
+        return np.column_stack([arr, arr])
+    if arr.ndim == 2:
+        if arr.shape != (n_sites, 2):
+            raise ValueError(f"v must have shape (n_sites,2)={(n_sites,2)}, got {arr.shape}")
+        return arr
+    raise ValueError("v must be None, length-n_sites, or shape (n_sites,2)")
+
+
+def _normalize_u(u: Union[float, Sequence[float]], n_sites: int) -> np.ndarray:
+    if isinstance(u, (int, float, np.floating)):
+        return np.full(n_sites, float(u), dtype=float)
+    arr = np.asarray(u, dtype=float)
+    if arr.shape != (n_sites,):
+        raise ValueError(f"u must be scalar or length-n_sites={n_sites}, got shape {arr.shape}")
+    return arr
+
+
+def _default_1d_chain_edges(n_sites: int, *, periodic: bool = False) -> list[tuple[int, int]]:
+    edges = [(i, i + 1) for i in range(n_sites - 1)]
+    if periodic and n_sites > 2:
+        edges.append((n_sites - 1, 0))
+    return edges
+
+
+def build_fermionic_hubbard(
+    n_sites: int,
+    t: Union[float, complex] = 1.0,
+    u: Union[float, Sequence[float]] = 4.0,
+    *,
+    edges: Optional[Iterable[Edge]] = None,
+    v: Optional[Union[Sequence[float], Sequence[Sequence[float]]]] = None,
+    atol: float = 0.0,
+) -> FermionicOp:
+    if n_sites < 1:
+        raise ValueError("n_sites must be >= 1")
+
+    v_mat = _normalize_onsite_potential(v, n_sites)
+    u_vec = _normalize_u(u, n_sites)
+
+    if edges is None:
+        edges_list: list[Edge] = _default_1d_chain_edges(n_sites, periodic=False)
+    else:
+        edges_list = list(edges)
+
+    data: Dict[str, complex] = {}
+
+    for i in range(n_sites):
+        for spin in (0, 1):
+            p = _spin_orbital_index(i, spin, n_sites)
+            _add_term(data, f"+_{p} -_{p}", complex(v_mat[i, spin]), atol=atol)
+
+    for edge in edges_list:
+        if len(edge) == 2:
+            i, j = int(edge[0]), int(edge[1])
+            tij = complex(t)
+        elif len(edge) == 3:
+            i, j = int(edge[0]), int(edge[1])
+            tij = complex(edge[2])
+        else:
+            raise ValueError(f"edge must be (i,j) or (i,j,tij), got: {edge}")
+
+        if i == j:
+            raise ValueError(f"invalid edge with i==j: {(i, j)}")
+        if not (0 <= i < n_sites and 0 <= j < n_sites):
+            raise ValueError(f"edge indices out of range: {(i, j)} (n_sites={n_sites})")
+
+        for spin in (0, 1):
+            pi = _spin_orbital_index(i, spin, n_sites)
+            pj = _spin_orbital_index(j, spin, n_sites)
+            _add_term(data, f"+_{pi} -_{pj}", -tij, atol=atol)
+            _add_term(data, f"+_{pj} -_{pi}", -np.conjugate(tij), atol=atol)
+
+    for i in range(n_sites):
+        p_up = _spin_orbital_index(i, 0, n_sites)
+        p_dn = _spin_orbital_index(i, 1, n_sites)
+        _add_term(
+            data,
+            f"+_{p_up} -_{p_up} +_{p_dn} -_{p_dn}",
+            complex(u_vec[i]),
+            atol=atol,
+        )
+
+    return FermionicOp(data, num_spin_orbitals=2 * n_sites)
+
+
+def _legacy_dimer_fermionic(t: float, u: float, dv: float) -> FermionicOp:
     data = {
         "+_0 -_1": -t,
         "+_1 -_0": -t,
@@ -86,17 +201,51 @@ def build_fermionic_hubbard(t: float, u: float, dv: float) -> FermionicOp:
     return FermionicOp(data, num_spin_orbitals=4)
 
 
-def build_qubit_hamiltonian(t: float, u: float, dv: float) -> tuple[SparsePauliOp, JordanWignerMapper]:
-    ferm_op = build_fermionic_hubbard(t, u, dv)
+def build_qubit_hamiltonian_from_fermionic(
+    ferm_op: FermionicOp,
+    *,
+    simplify_atol: float = 1e-12,
+) -> tuple[SparsePauliOp, JordanWignerMapper]:
     mapper = JordanWignerMapper()
-    qubit_op = mapper.map(ferm_op).simplify(atol=1e-12)
+    qubit_op = mapper.map(ferm_op)
+    if simplify_atol is not None:
+        qubit_op = qubit_op.simplify(atol=simplify_atol)
     return qubit_op, mapper
 
 
+def build_qubit_hamiltonian(t: float, u: float, dv: float) -> tuple[SparsePauliOp, JordanWignerMapper]:
+    ferm_op = build_fermionic_hubbard(
+        n_sites=2,
+        t=t,
+        u=u,
+        edges=[(0, 1)],
+        v=[-dv / 2, dv / 2],
+    )
+    return build_qubit_hamiltonian_from_fermionic(ferm_op)
+
+
 def exact_ground_energy(qubit_op: SparsePauliOp) -> float:
-    mat = qubit_op.to_matrix()
-    evals = np.linalg.eigvalsh(mat)
-    return float(np.min(np.real(evals)))
+    n = qubit_op.num_qubits
+    dim = 2 ** n
+
+    if dim <= 4096:
+        mat = qubit_op.to_matrix()
+        evals = np.linalg.eigvalsh(mat)
+        return float(np.min(np.real(evals)))
+
+    try:
+        from scipy.sparse.linalg import eigsh
+
+        try:
+            mat = qubit_op.to_matrix(sparse=True)
+        except TypeError:
+            mat = qubit_op.to_matrix()
+        val = eigsh(mat, k=1, which="SA", return_eigenvectors=False)[0]
+        return float(np.real(val))
+    except Exception:
+        mat = qubit_op.to_matrix()
+        evals = np.linalg.eigvalsh(mat)
+        return float(np.min(np.real(evals)))
 
 
 def build_ansatz(
@@ -115,6 +264,14 @@ def build_ansatz(
             su2_gates=["ry", "rz"],
             reps=reps,
             entanglement="linear",
+        )
+
+    if ansatz_name == "efficient_su2":
+        return efficient_su2(
+            num_qubits,
+            su2_gates=["ry", "rz"],
+            reps=reps,
+            entanglement="full",
         )
 
     if ansatz_name == "uccsd":
@@ -153,6 +310,14 @@ def _build_optimizer(name: str, maxiter: int):
     if name == "COBYLA":
         return COBYLA(maxiter=maxiter)
     raise ValueError(f"Unknown optimizer: {name}")
+
+
+def _default_reps(ansatz_name: str, requested: Optional[int]) -> int:
+    if requested is not None:
+        return requested
+    if ansatz_name in {"clustered", "efficient_su2"}:
+        return 2
+    return 1
 
 
 def run_vqe_with_estimator(
@@ -237,6 +402,13 @@ def load_params(path: str) -> list[float]:
     if "params" in data:
         return list(map(float, data["params"]))
     raise KeyError("No params found in JSON; expected 'theta' or 'params'.")
+
+
+def _params_path_for_ansatz(path: str, ansatz_name: str) -> str:
+    root, ext = os.path.splitext(path)
+    if ext:
+        return f"{root}_{ansatz_name}{ext}"
+    return f"{path}_{ansatz_name}"
 
 
 def compile_ansatz_and_op(
@@ -387,6 +559,37 @@ def ibm_optimize_on_hardware(
 
 
 def _run_self_test() -> None:
+    t = 1.0
+    u = 4.0
+    dv = 0.5
+    ferm2 = build_fermionic_hubbard(
+        n_sites=2,
+        t=t,
+        u=u,
+        edges=[(0, 1)],
+        v=[-dv / 2, dv / 2],
+    )
+    legacy = _legacy_dimer_fermionic(t, u, dv)
+    if not ferm2.equiv(legacy, atol=1e-12):
+        raise AssertionError("2-site builder does not match legacy dimer terms.")
+    qubit2, _ = build_qubit_hamiltonian_from_fermionic(ferm2)
+    e2 = exact_ground_energy(qubit2)
+    print(f"n_sites=2 exact E0 = {e2:.10f}")
+
+    for n_sites in range(3, 7):
+        ferm = build_fermionic_hubbard(
+            n_sites=n_sites,
+            t=t,
+            u=u,
+            edges=_default_1d_chain_edges(n_sites, periodic=False),
+            v=None,
+        )
+        qubit_op, _ = build_qubit_hamiltonian_from_fermionic(ferm)
+        e0 = exact_ground_energy(qubit_op)
+        print(
+            f"n_sites={n_sites} (qubits={qubit_op.num_qubits}) exact E0 = {e0:.10f}"
+        )
+
     qubit_op, mapper = build_qubit_hamiltonian(1.0, 2.0, 0.5)
     exact = exact_ground_energy(qubit_op)
     ansatz = build_ansatz("clustered", qubit_op.num_qubits, 1, mapper)
@@ -503,17 +706,20 @@ def main() -> None:
         description="Hubbard dimer JW mapping with local VQE warm-start and IBM eval-only modes."
     )
     parser.add_argument("--t", type=float, default=1.0)
-    parser.add_argument("--u", type=float, default=2.0)
+    parser.add_argument("--u", type=float, default=4.0)
     parser.add_argument("--dv", type=float, default=0.5)
 
     parser.add_argument(
         "--ansatz",
         choices=[
             "clustered",
+            "efficient_su2",
             "uccsd",
             "hea",
             "hardware",
             "hardware-efficient",
+            "both",
+            "all",
         ],
         default=None,
     )
@@ -594,6 +800,8 @@ def main() -> None:
     if args.ibm_opt and args.local_vqe:
         raise RuntimeError("ibm-opt cannot be combined with local-vqe.")
 
+    ibm_mode = args.ibm_sim or args.ibm_opt or args.ibm_eval or args.ibm_search
+
     ansatz_choice = args.ansatz
     if ansatz_choice is None:
         if args.ibm_opt:
@@ -604,18 +812,70 @@ def main() -> None:
             ansatz_choice = "clustered"
     ansatz_choice = _normalize_ansatz(ansatz_choice)
 
-    reps = args.reps
-    if reps is None:
-        if ansatz_choice == "clustered":
-            reps = 2
-        elif ansatz_choice == "uccsd":
-            reps = 1
-        else:
-            reps = 1
-
     qubit_op, mapper = build_qubit_hamiltonian(args.t, args.u, args.dv)
     exact = exact_ground_energy(qubit_op)
     hea_occ = _parse_occ_list(args.hea_hf_occ)
+
+    multi_kinds: Optional[list[str]] = None
+    if ansatz_choice in {"both", "all"}:
+        if ibm_mode:
+            if args.ibm_opt:
+                ansatz_choice = "hea"
+            elif args.ibm_sim:
+                ansatz_choice = "uccsd"
+            else:
+                ansatz_choice = "clustered"
+            print(
+                "IBM mode uses a single ansatz; "
+                f"defaulting to {ansatz_choice}."
+            )
+        else:
+            multi_kinds = ["clustered", "uccsd"]
+            if ansatz_choice == "all":
+                multi_kinds.append("efficient_su2")
+
+    if multi_kinds is not None:
+        if args.load_params:
+            raise RuntimeError("--load-params cannot be used with ansatz=both/all.")
+        for kind in multi_kinds:
+            reps = _default_reps(kind, args.reps)
+            ansatz = build_ansatz(
+                kind,
+                qubit_op.num_qubits,
+                reps,
+                mapper,
+                hea_rotation=args.hea_rotation,
+                hea_entanglement=args.hea_entanglement,
+                hea_occ=hea_occ if hea_occ else None,
+            )
+            local_result = run_local_vqe(
+                qubit_op,
+                ansatz,
+                restarts=args.restarts,
+                maxiter=args.maxiter,
+                optimizer_name=args.optimizer,
+                seed=args.seed,
+            )
+            print(f"local-vqe ({kind}) best energy: {local_result.energy:.10f}")
+            print(f"exact energy:          {exact:.10f}")
+            print(f"delta:                 {local_result.energy - exact:.10e}")
+            print(f"elapsed:               {local_result.seconds:.2f}s")
+
+            if args.save_params:
+                save_params(
+                    _params_path_for_ansatz(args.save_params, kind),
+                    local_result.params,
+                    {
+                        "t": args.t,
+                        "u": args.u,
+                        "dv": args.dv,
+                        "ansatz": kind,
+                        "reps": reps,
+                    },
+                )
+        return
+
+    reps = _default_reps(ansatz_choice, args.reps)
     try:
         ansatz = build_ansatz(
             ansatz_choice,
@@ -630,8 +890,7 @@ def main() -> None:
         if args.ibm_sim and ansatz_choice == "uccsd":
             print(f"Warning: UCCSD failed; falling back to clustered ({exc}).")
             ansatz_choice = "clustered"
-            if args.reps is None:
-                reps = 2
+            reps = _default_reps(ansatz_choice, args.reps)
             ansatz = build_ansatz(
                 ansatz_choice,
                 qubit_op.num_qubits,
