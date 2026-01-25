@@ -1,5 +1,0 @@
-
-#
-#   define Ehrenfest field class
-#
-
