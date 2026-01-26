@@ -1,1 +1,2 @@
-"""Quantum utilities for pydephasing."""
+"""Quantum utilities for Hubbard VQE."""
+

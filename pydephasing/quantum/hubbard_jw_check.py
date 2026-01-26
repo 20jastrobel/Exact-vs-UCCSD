@@ -6,23 +6,20 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import time
-from dataclasses import dataclass
-from typing import Dict, Iterable, Optional, Sequence, Tuple, Union
+from typing import Optional, Sequence
 
 import numpy as np
 from qiskit.circuit import QuantumCircuit
-from qiskit.circuit.library import efficient_su2
 from qiskit.quantum_info import SparsePauliOp
-from qiskit_algorithms import VQE
-from qiskit_algorithms.optimizers import COBYLA, L_BFGS_B, SLSQP
-from qiskit_nature.second_q.circuit.library import HartreeFock, UCCSD
-from qiskit_nature.second_q.mappers import JordanWignerMapper
-from qiskit_nature.second_q.operators import FermionicOp
-from qiskit.primitives import StatevectorEstimator
 
-from pydephasing.quantum.hardware_efficient_ansatz import (
-    build_hardware_efficient_ansatz,
+from pydephasing.quantum.ansatz import build_ansatz
+from pydephasing.quantum.hamiltonian.exact import exact_ground_energy
+from pydephasing.quantum.hamiltonian.hubbard import (
+    _legacy_dimer_fermionic,
+    build_fermionic_hubbard,
+    build_qubit_hamiltonian,
+    build_qubit_hamiltonian_from_fermionic,
+    default_1d_chain_edges,
 )
 from pydephasing.quantum.ibm_runtime_tools import (
     choose_backend,
@@ -34,16 +31,7 @@ from pydephasing.quantum.ibm_sim_tools import (
     build_aer_estimator_for_backend,
     load_fake_backend,
 )
-
-
-@dataclass
-class LocalVQEResult:
-    energy: float
-    params: list[float]
-    seconds: float
-
-
-Edge = Union[Tuple[int, int], Tuple[int, int, complex]]
+from pydephasing.quantum.vqe.runner import run_local_vqe, run_vqe_with_estimator
 
 
 def _str_to_bool(value: str) -> bool:
@@ -72,317 +60,12 @@ def _normalize_ansatz(name: str) -> str:
         return "hea"
     return name
 
-
-def _spin_orbital_index(site: int, spin: int, n_sites: int) -> int:
-    if site < 0 or site >= n_sites:
-        raise ValueError(f"site out of range: {site} (n_sites={n_sites})")
-    if spin not in (0, 1):
-        raise ValueError(f"spin must be 0(up) or 1(down), got {spin}")
-    return site + spin * n_sites
-
-
-def _add_term(data: Dict[str, complex], label: str, coeff: complex, *, atol: float = 0.0) -> None:
-    if atol and abs(coeff) <= atol:
-        return
-    data[label] = data.get(label, 0.0) + coeff
-    if atol and abs(data[label]) <= atol:
-        data.pop(label, None)
-
-
-def _normalize_onsite_potential(
-    v: Optional[Union[Sequence[float], Sequence[Sequence[float]]]],
-    n_sites: int,
-) -> np.ndarray:
-    if v is None:
-        return np.zeros((n_sites, 2), dtype=float)
-
-    arr = np.asarray(v, dtype=float)
-    if arr.ndim == 1:
-        if arr.shape[0] != n_sites:
-            raise ValueError(f"v must have length n_sites={n_sites}, got {arr.shape[0]}")
-        return np.column_stack([arr, arr])
-    if arr.ndim == 2:
-        if arr.shape != (n_sites, 2):
-            raise ValueError(f"v must have shape (n_sites,2)={(n_sites,2)}, got {arr.shape}")
-        return arr
-    raise ValueError("v must be None, length-n_sites, or shape (n_sites,2)")
-
-
-def _normalize_u(u: Union[float, Sequence[float]], n_sites: int) -> np.ndarray:
-    if isinstance(u, (int, float, np.floating)):
-        return np.full(n_sites, float(u), dtype=float)
-    arr = np.asarray(u, dtype=float)
-    if arr.shape != (n_sites,):
-        raise ValueError(f"u must be scalar or length-n_sites={n_sites}, got shape {arr.shape}")
-    return arr
-
-
-def _default_1d_chain_edges(n_sites: int, *, periodic: bool = False) -> list[tuple[int, int]]:
-    edges = [(i, i + 1) for i in range(n_sites - 1)]
-    if periodic and n_sites > 2:
-        edges.append((n_sites - 1, 0))
-    return edges
-
-
-def build_fermionic_hubbard(
-    n_sites: int,
-    t: Union[float, complex] = 1.0,
-    u: Union[float, Sequence[float]] = 4.0,
-    *,
-    edges: Optional[Iterable[Edge]] = None,
-    v: Optional[Union[Sequence[float], Sequence[Sequence[float]]]] = None,
-    atol: float = 0.0,
-) -> FermionicOp:
-    if n_sites < 1:
-        raise ValueError("n_sites must be >= 1")
-
-    v_mat = _normalize_onsite_potential(v, n_sites)
-    u_vec = _normalize_u(u, n_sites)
-
-    if edges is None:
-        edges_list: list[Edge] = _default_1d_chain_edges(n_sites, periodic=False)
-    else:
-        edges_list = list(edges)
-
-    data: Dict[str, complex] = {}
-
-    for i in range(n_sites):
-        for spin in (0, 1):
-            p = _spin_orbital_index(i, spin, n_sites)
-            _add_term(data, f"+_{p} -_{p}", complex(v_mat[i, spin]), atol=atol)
-
-    for edge in edges_list:
-        if len(edge) == 2:
-            i, j = int(edge[0]), int(edge[1])
-            tij = complex(t)
-        elif len(edge) == 3:
-            i, j = int(edge[0]), int(edge[1])
-            tij = complex(edge[2])
-        else:
-            raise ValueError(f"edge must be (i,j) or (i,j,tij), got: {edge}")
-
-        if i == j:
-            raise ValueError(f"invalid edge with i==j: {(i, j)}")
-        if not (0 <= i < n_sites and 0 <= j < n_sites):
-            raise ValueError(f"edge indices out of range: {(i, j)} (n_sites={n_sites})")
-
-        for spin in (0, 1):
-            pi = _spin_orbital_index(i, spin, n_sites)
-            pj = _spin_orbital_index(j, spin, n_sites)
-            _add_term(data, f"+_{pi} -_{pj}", -tij, atol=atol)
-            _add_term(data, f"+_{pj} -_{pi}", -np.conjugate(tij), atol=atol)
-
-    for i in range(n_sites):
-        p_up = _spin_orbital_index(i, 0, n_sites)
-        p_dn = _spin_orbital_index(i, 1, n_sites)
-        _add_term(
-            data,
-            f"+_{p_up} -_{p_up} +_{p_dn} -_{p_dn}",
-            complex(u_vec[i]),
-            atol=atol,
-        )
-
-    return FermionicOp(data, num_spin_orbitals=2 * n_sites)
-
-
-def _legacy_dimer_fermionic(t: float, u: float, dv: float) -> FermionicOp:
-    data = {
-        "+_0 -_1": -t,
-        "+_1 -_0": -t,
-        "+_2 -_3": -t,
-        "+_3 -_2": -t,
-        "+_1 -_1": dv / 2,
-        "+_3 -_3": dv / 2,
-        "+_0 -_0": -dv / 2,
-        "+_2 -_2": -dv / 2,
-        "+_0 -_0 +_2 -_2": u,
-        "+_1 -_1 +_3 -_3": u,
-    }
-    return FermionicOp(data, num_spin_orbitals=4)
-
-
-def build_qubit_hamiltonian_from_fermionic(
-    ferm_op: FermionicOp,
-    *,
-    simplify_atol: float = 1e-12,
-) -> tuple[SparsePauliOp, JordanWignerMapper]:
-    mapper = JordanWignerMapper()
-    qubit_op = mapper.map(ferm_op)
-    if simplify_atol is not None:
-        qubit_op = qubit_op.simplify(atol=simplify_atol)
-    return qubit_op, mapper
-
-
-def build_qubit_hamiltonian(t: float, u: float, dv: float) -> tuple[SparsePauliOp, JordanWignerMapper]:
-    ferm_op = build_fermionic_hubbard(
-        n_sites=2,
-        t=t,
-        u=u,
-        edges=[(0, 1)],
-        v=[-dv / 2, dv / 2],
-    )
-    return build_qubit_hamiltonian_from_fermionic(ferm_op)
-
-
-def exact_ground_energy(qubit_op: SparsePauliOp) -> float:
-    n = qubit_op.num_qubits
-    dim = 2 ** n
-
-    if dim <= 4096:
-        mat = qubit_op.to_matrix()
-        evals = np.linalg.eigvalsh(mat)
-        return float(np.min(np.real(evals)))
-
-    try:
-        from scipy.sparse.linalg import eigsh
-
-        try:
-            mat = qubit_op.to_matrix(sparse=True)
-        except TypeError:
-            mat = qubit_op.to_matrix()
-        val = eigsh(mat, k=1, which="SA", return_eigenvectors=False)[0]
-        return float(np.real(val))
-    except Exception:
-        mat = qubit_op.to_matrix()
-        evals = np.linalg.eigvalsh(mat)
-        return float(np.min(np.real(evals)))
-
-
-def build_ansatz(
-    ansatz_name: str,
-    num_qubits: int,
-    reps: int,
-    mapper: JordanWignerMapper,
-    *,
-    hea_rotation: str = "ry",
-    hea_entanglement: str = "linear",
-    hea_occ: Optional[list[int]] = None,
-) -> QuantumCircuit:
-    if ansatz_name == "clustered":
-        return efficient_su2(
-            num_qubits,
-            su2_gates=["ry", "rz"],
-            reps=reps,
-            entanglement="linear",
-        )
-
-    if ansatz_name == "efficient_su2":
-        return efficient_su2(
-            num_qubits,
-            su2_gates=["ry", "rz"],
-            reps=reps,
-            entanglement="full",
-        )
-
-    if ansatz_name == "uccsd":
-        num_spatial_orbitals = 2
-        num_particles = (1, 1)
-        initial_state = HartreeFock(
-            num_spatial_orbitals=num_spatial_orbitals,
-            num_particles=num_particles,
-            qubit_mapper=mapper,
-        )
-        return UCCSD(
-            num_spatial_orbitals=num_spatial_orbitals,
-            num_particles=num_particles,
-            qubit_mapper=mapper,
-            reps=reps,
-            initial_state=initial_state,
-        )
-
-    if ansatz_name == "hea":
-        return build_hardware_efficient_ansatz(
-            n_qubits=num_qubits,
-            reps=reps,
-            entanglement=hea_entanglement,
-            initial_occupations=hea_occ,
-            rotation=hea_rotation,
-        )
-
-    raise ValueError(f"Unknown ansatz: {ansatz_name}")
-
-
-def _build_optimizer(name: str, maxiter: int):
-    if name == "L_BFGS_B":
-        return L_BFGS_B(maxiter=maxiter)
-    if name == "SLSQP":
-        return SLSQP(maxiter=maxiter)
-    if name == "COBYLA":
-        return COBYLA(maxiter=maxiter)
-    raise ValueError(f"Unknown optimizer: {name}")
-
-
 def _default_reps(ansatz_name: str, requested: Optional[int]) -> int:
     if requested is not None:
         return requested
     if ansatz_name in {"clustered", "efficient_su2"}:
         return 2
     return 1
-
-
-def run_vqe_with_estimator(
-    qubit_op: SparsePauliOp,
-    ansatz: QuantumCircuit,
-    estimator,
-    *,
-    restarts: int,
-    maxiter: int,
-    optimizer_name: str,
-    seed: int,
-) -> LocalVQEResult:
-    rng = np.random.default_rng(seed)
-
-    best_energy: Optional[float] = None
-    best_params: list[float] = []
-    start = time.perf_counter()
-
-    for restart_idx in range(restarts):
-        optimizer = _build_optimizer(optimizer_name, maxiter)
-        initial_point = rng.random(ansatz.num_parameters) * 2 * np.pi
-        vqe = VQE(
-            estimator=estimator,
-            ansatz=ansatz,
-            optimizer=optimizer,
-            initial_point=initial_point,
-        )
-        result = vqe.compute_minimum_eigenvalue(qubit_op)
-        energy = float(np.real(result.eigenvalue))
-
-        if best_energy is None or energy < best_energy:
-            best_energy = energy
-            best_params = list(map(float, result.optimal_point))
-
-        print(
-            f"local-vqe restart {restart_idx + 1}/{restarts}: "
-            f"energy={energy:.10f}"
-        )
-
-    if best_energy is None:
-        raise RuntimeError("Local VQE failed to produce an energy.")
-
-    elapsed = time.perf_counter() - start
-    return LocalVQEResult(best_energy, best_params, elapsed)
-
-
-def run_local_vqe(
-    qubit_op: SparsePauliOp,
-    ansatz: QuantumCircuit,
-    *,
-    restarts: int,
-    maxiter: int,
-    optimizer_name: str,
-    seed: int,
-) -> LocalVQEResult:
-    estimator = StatevectorEstimator()
-    return run_vqe_with_estimator(
-        qubit_op,
-        ansatz,
-        estimator,
-        restarts=restarts,
-        maxiter=maxiter,
-        optimizer_name=optimizer_name,
-        seed=seed,
-    )
 
 
 def save_params(path: str, params: Sequence[float], meta: dict) -> None:
@@ -581,7 +264,7 @@ def _run_self_test() -> None:
             n_sites=n_sites,
             t=t,
             u=u,
-            edges=_default_1d_chain_edges(n_sites, periodic=False),
+            edges=default_1d_chain_edges(n_sites, periodic=False),
             v=None,
         )
         qubit_op, _ = build_qubit_hamiltonian_from_fermionic(ferm)
