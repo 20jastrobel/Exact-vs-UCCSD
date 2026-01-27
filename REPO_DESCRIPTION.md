@@ -4,22 +4,28 @@ This repository is a small, focused quantum-chemistry / condensed-matter sandbox
 
 - A clean Hubbard Hamiltonian builder (fermionic then mapped to qubits via Jordan-Wigner).
 - Multiple ansatz builders (hardware efficient, clustered EfficientSU2, UCCSD).
+- ADAPT-VQE and Meta-ADAPT-VQE flows with operator pools and meta-learned inner optimizers.
 - Local VQE (statevector) workflows for quick iteration and warm starts.
 - IBM Runtime workflows for evaluation or simple search/optimization on real hardware.
 - IBM-like local simulation using Aer + fake backends for noise realism.
 
-The repository is designed to compare exact ground state energies vs VQE results and to stage parameters for IBM runs. The scripts are CLI-driven and meant for experimentation, not a full library.
+The repository is designed to compare exact ground state energies vs VQE/ADAPT-VQE results and to stage parameters for IBM runs. The scripts are CLI-driven and meant for experimentation, not a full library.
 
 
 ## Repository layout (high level)
 
 - `run_vqe_local.py`
   - Minimal local VQE entrypoint for the Hubbard dimer.
+- `run_adapt_meta.py`
+  - Meta-ADAPT-VQE entrypoint (operator pools + LSTM meta-optimizer or L-BFGS-B).
 - `pydephasing/`
   - Python package containing quantum utilities.
-  - `quantum/` holds ansatz, Hamiltonian, VQE runner, and IBM tools.
+  - `quantum/` holds ansatz, Hamiltonian, VQE runner, ADAPT/meta-VQE, and IBM tools.
+  - `quantum/vqe/test_*.py` contains lightweight correctness checks for ADAPT components.
 - `hubbard_params.json`, `hea_ibm_params.json`
   - Example parameter sets saved from runs.
+- `scripts/train_meta_lstm.py`
+  - Train a coordinate-wise LSTM meta-optimizer for ADAPT-VQE.
 - `dependencies/requirements.txt`
   - Full dependency list (many are not directly used by this tiny repo).
 
@@ -32,6 +38,8 @@ Core scientific intent:
 - Map the fermionic Hamiltonian to qubits via Jordan-Wigner.
 - Find ground state energy exactly (dense diagonalization, with sparse fallback).
 - Approximate ground state energy using VQE with various ansatz families.
+- Grow ansatz circuits adaptively with ADAPT-VQE and operator pools.
+- Explore meta-learned inner optimizers (coordinate-wise LSTM) or hybrid LSTM+L-BFGS-B.
 - Optionally evaluate or optimize ansatz parameters with IBM Runtime backends.
 
 The scripts are a convenient experimental harness, not a polished product. Inputs are small; most workflows are tailored to the 4-qubit Hubbard dimer.
@@ -44,6 +52,8 @@ The scripts are a convenient experimental harness, not a polished product. Input
 - QuantumCircuit: ansatz circuit.
 - VQE: qiskit-algorithms VQE routine.
 - Estimator / EstimatorV2: energy estimation primitive.
+- Operator pool: Pauli-string pool or CSE density-operator pool for ADAPT-VQE.
+- Coordinate-wise LSTM: meta-optimizer with per-parameter hidden state.
 
 
 ## Environment variables used (IBM runtime modes)
@@ -75,6 +85,17 @@ The scripts are a convenient experimental harness, not a polished product. Input
   - IBM search (evaluate a jittered neighborhood of parameters),
   - IBM hardware optimization (simple iterative stochastic search),
   - IBM-like noisy simulation using fake backends.
+
+### 3) Meta-ADAPT-VQE workflow
+
+- `run_adapt_meta.py` runs ADAPT-VQE with operator pools and inner optimizers:
+  - pool based on Hamiltonian terms (plus imaginary partners) or CSE density ops,
+  - inner optimizer options: L-BFGS-B, LSTM meta-optimizer, or hybrid.
+
+### 4) Meta-optimizer training
+
+- `scripts/train_meta_lstm.py` trains a coordinate-wise LSTM optimizer on random
+  Hubbard dimer instances using a surrogate loss and parameter-shift gradients.
 
 
 ## Pseudocode summary for all modules
@@ -531,6 +552,380 @@ function build(maxiter):
 ```
 
 
+# ============================================
+# pydephasing/quantum/vqe/adapt_vqe_meta.py
+# ============================================
+
+```pseudo
+class MetaAdaptVQEResult:
+    energy: float
+    params: list[float]
+    operators: list[str]
+    diagnostics: dict
+
+function build_operator_pool_from_hamiltonian(qubit_op, mode="ham_terms_plus_imag_partners"):
+    identity = "I" * num_qubits
+    base_pool = unique non-identity Pauli labels from qubit_op
+    if mode == "ham_terms": return base_pool
+    if mode != "ham_terms_plus_imag_partners": raise ValueError
+
+    pool = base_pool + imaginary partners (swap X<->Y per position)
+    also add single-qubit X/Y terms (per qubit) to avoid stagnation
+    return pool
+
+function build_cse_density_pool_from_fermionic(ferm_op, mapper,
+                                               include_diagonal=False, dedup_tol=1e-12):
+    for each label in ferm_op data:
+        if label is single excitation (c^dagger_p c_q) and (p != q or include_diagonal):
+            gamma = FermionicOp({label: 1.0})
+        elif include_diagonal and label is 4-term density:
+            gamma = FermionicOp({label: 1.0})
+        else: continue
+
+        k_op = gamma - gamma†
+        if k_op empty: continue
+        qubit_k = mapper.map(k_op).simplify(atol=dedup_tol)
+        a_op = (-i) * qubit_k
+
+        paulis = []
+        for (label, coeff) in a_op:
+            skip identity or imaginary coeffs
+            if |coeff.real| <= dedup_tol: continue
+            paulis.append((label, coeff.real))
+
+        deduplicate specs by sorted labels and rounded weights
+        pool.append({"name": f"gamma({label})", "paulis": paulis})
+
+    return pool
+
+function build_reference_state(num_qubits, occupations):
+    qc = QuantumCircuit(num_qubits)
+    for idx in occupations: qc.x(idx)
+    return qc
+
+function build_adapt_circuit(reference_state, operators):
+    circuit = reference_state
+    params = ParameterVector("theta", len(operators))
+    for i, label in operators:
+        gate = PauliEvolutionGate(Pauli(label), time=params[i]/2)
+        circuit.append(gate, all_qubits)
+    return circuit, params
+
+function build_adapt_circuit_grouped(reference_state, operator_specs):
+    circuit = reference_state
+    params = ParameterVector("theta", len(operator_specs))
+    for i, spec in operator_specs:
+        for (label, weight) in spec["paulis"]:
+            gate = PauliEvolutionGate(Pauli(label), time=params[i]*weight/2)
+            circuit.append(gate, all_qubits)
+    return circuit, params
+
+function estimate_energy(estimator, circuit, qubit_op, params):
+    job = estimator.run([(circuit, qubit_op, params)])
+    return real(result[0].data.evs)
+
+function parameter_shift_grad(energy_fn, theta, shift=pi/2):
+    for each idx:
+        grad[idx] = 0.5 * (energy_fn(theta+shift) - energy_fn(theta-shift))
+    return grad
+
+function _append_probe_gate(circuit, label, angle):
+    probe = copy(circuit)
+    probe.append(PauliEvolutionGate(Pauli(label), time=angle/2), all_qubits)
+    return probe
+
+function _imaginary_partners(label):
+    return labels with each X replaced by Y and each Y replaced by X
+
+function _wrap_angles(theta):
+    return (theta + pi) mod 2pi - pi
+
+function _probe_shift_and_coeff(convention):
+    if "half_angle": return (pi/2, 0.5)
+    if "full_angle": return (pi/4, 1.0)
+    else raise ValueError
+
+function _compute_grouped_pool_gradients(estimator, circuit, qubit_op, theta, pool_specs,
+                                         probe_convention):
+    shift, coeff = _probe_shift_and_coeff
+    compute unique labels across pool_specs
+    for each unique label:
+        g[label] = coeff * (E(+shift) - E(-shift))
+    for each spec:
+        gradient = sum(weight * g[label] for (label, weight) in spec["paulis"])
+        append to gradients
+    return gradients
+
+function _lbfgs_optimize(theta0, energy_fn, grad_fn, theta_bound="none",
+                         maxiter=None, restarts=1, rng=None):
+    if theta_bound == "pi": bounds = [-pi, pi] per coord
+    for restart in 0..restarts-1:
+        x0 = theta0 or random uniform in [-pi, pi]
+        result = scipy.minimize(fun=energy_fn, jac=grad_fn, method="L-BFGS-B")
+        keep best result, track nfev/njev, status
+    return best_x, stats
+
+function _meta_optimize(theta0, energy_fn, grad_fn, steps, model,
+                        r, step_scale, dtheta_clip, verbose):
+    init LSTM hidden/cell states per parameter
+    for inner step:
+        energy = energy_fn(theta)
+        grad = grad_fn(theta)
+        x = preprocess_gradients_torch(grad, r=r)
+        delta = model(x, (h, c))
+        clip and scale delta
+        theta += delta
+        collect stats (avg ||Δθ||, max|Δθ|)
+    return theta, stats
+
+function _hybrid_optimize(theta0, energy_fn, grad_fn, model,
+                          r, step_scale, dtheta_clip, warmup_steps,
+                          theta_bound, lbfgs_maxiter, lbfgs_restarts):
+    theta_meta, meta_stats = _meta_optimize(...)
+    theta_lbfgs, lbfgs_stats = _lbfgs_optimize(...)
+    return theta_lbfgs, {"meta": meta_stats, "lbfgs": lbfgs_stats}
+
+function run_meta_adapt_vqe(qubit_op, reference_state, estimator,
+                            pool=None, pool_mode="ham_terms_plus_imag_partners",
+                            ferm_op=None, mapper=None,
+                            max_depth=20, inner_steps=30,
+                            eps_grad=1e-4, eps_energy=1e-3,
+                            lstm_optimizer=None, meta_model=None,
+                            seed=11, r=10.0, reuse_lstm_state=True,
+                            wrap_angles=True, probe_convention="half_angle",
+                            inner_optimizer="lbfgs",
+                            theta_bound="none",
+                            meta_step_scale=1.0, meta_dtheta_clip=0.25,
+                            meta_warmup_steps=15,
+                            lbfgs_maxiter=None, lbfgs_restarts=1,
+                            theta_init_noise=0.0, allow_repeats=False,
+                            verbose=True):
+
+    if pool_mode == "cse_density_ops":
+        pool_specs = provided or build_cse_density_pool_from_fermionic(ferm_op, mapper)
+    else:
+        pool_labels = provided or build_operator_pool_from_hamiltonian(qubit_op, mode)
+
+    if lstm_optimizer is None: lstm_optimizer = CoordinateWiseLSTMOptimizer(seed)
+
+    theta = empty, energy_current = E(reference_state)
+    ops = []
+    diagnostics = {"outer": [], "pool_size": [len(pool)]}
+    shift, coeff = _probe_shift_and_coeff
+
+    for outer_idx in 0..max_depth-1:
+        circuit = build_adapt_circuit(_grouped if cse)
+        compute pool_gradients:
+            - if cse: use grouped gradients
+            - else: per label probe via +/- shift
+        if |ΔE| < eps_energy or max|g| < eps_grad: break
+        choose operator with max |g|, append to ops
+        drop from pool unless allow_repeats
+        extend theta with 0 (+ noise)
+        update / reuse LSTM state
+
+        define energy_fn, grad_fn
+        run inner optimizer:
+            - "meta": _meta_optimize
+            - "lbfgs": _lbfgs_optimize
+            - "hybrid": _hybrid_optimize
+        if wrap_angles: theta = _wrap_angles(theta)
+
+        energy_current = energy_fn(theta)
+        diagnostics["outer"].append({
+            outer_iter, chosen_op, chosen_components,
+            max_grad, energy, pool_gradients,
+            inner_stats, inner_optimizer
+        })
+
+    return MetaAdaptVQEResult(energy_current, theta, ops, diagnostics)
+```
+
+
+# ==============================================
+# pydephasing/quantum/vqe/meta_lstm_optimizer.py
+# ==============================================
+
+```pseudo
+function preprocess_gradients(grad, r=10.0):
+    grad_arr = asarray(grad)
+    if empty: return zeros(n,2)
+    threshold = exp(-r)
+    if |g| >= threshold:
+        x[:,0] = log(|g|)/r
+        x[:,1] = sign(g)
+    else:
+        x[:,0] = -1
+        x[:,1] = exp(r) * g
+    return x
+
+class LSTMState:
+    h: array
+    c: array
+
+class CoordinateWiseLSTMOptimizer:
+    init(hidden_size=20, input_size=2, seed=None, weights=None, weight_scale=0.1):
+        if weights: load arrays (W_x, W_h, b, W_out, b_out)
+        else: random normal weights
+
+    function to_weights(): return weight dict
+    function init_state(n_coords): return zeros h and c
+
+    function step(grad, state, r=10.0):
+        x = preprocess_gradients(grad, r)
+        z = x @ W_x^T + h @ W_h^T + b
+        i = sigmoid(z[:,0:hs]); f = sigmoid(z[:,hs:2hs])
+        o = sigmoid(z[:,2hs:3hs]); g = tanh(z[:,3hs:4hs])
+        c_new = f*c + i*g
+        h_new = o * tanh(c_new)
+        delta = h_new @ W_out + b_out
+        return delta, LSTMState(h_new, c_new)
+```
+
+
+# =======================================
+# pydephasing/quantum/vqe/meta_lstm.py
+# =======================================
+
+```pseudo
+class CoordinateWiseLSTM(nn.Module):
+    init(hidden_size=20, input_size=2):
+        lstm = LSTMCell(input_size, hidden_size)
+        head = Linear(hidden_size -> 1)
+
+    forward(x, state):
+        if state None: h,c = zeros
+        else h,c = state
+        h,c = lstm(x, (h,c))
+        delta = head(h).squeeze(-1)
+        return delta, (h,c)
+
+function preprocess_gradients_torch(grad, r=10.0, device=None):
+    same transform as numpy version, but returns torch tensor
+
+function load_meta_lstm(path, device=None):
+    checkpoint = torch.load(path)
+    config = checkpoint["config"]
+    model = CoordinateWiseLSTM(hidden_size, input_size)
+    model.load_state_dict(checkpoint["state_dict"])
+    return model, config
+
+function save_meta_lstm(path, model, config):
+    torch.save({"state_dict": model.state_dict(), "config": config}, path)
+```
+
+
+# =============================
+# run_adapt_meta.py (entrypoint)
+# =============================
+
+```pseudo
+function main():
+    parse args: t,u,dv,sites,max_depth,inner_steps,eps_grad,eps_energy,seed,occ,
+                inner_optimizer(meta/lbfgs/hybrid), theta_bound, meta_* params,
+                theta_init_noise, lbfgs_restarts, allow_repeats, pool, weights, save, quiet
+
+    ferm_op = build_fermionic_hubbard(n_sites, t, u, edges, v)
+    qubit_op, mapper = build_qubit_hamiltonian_from_fermionic(ferm_op)
+    exact = exact_ground_energy(qubit_op)
+
+    reference_state = build_reference_state(num_qubits, occupations)
+
+    load meta weights if provided:
+        try load torch model via load_meta_lstm
+        else warn and fall back to random init
+    choose inner_optimizer default:
+        meta if weights loaded else lbfgs
+    if inner_optimizer in {meta, hybrid} and meta_model missing:
+        build CoordinateWiseLSTM (torch) or raise if torch missing
+
+    if weights endswith .npz: load numpy weights for CoordinateWiseLSTMOptimizer
+    lstm_optimizer = CoordinateWiseLSTMOptimizer(seed, weights)
+
+    estimator = StatevectorEstimator()
+    result = run_meta_adapt_vqe(... pool_mode, ferm_op, mapper, meta_model, etc ...)
+
+    print energy, depth, diagnostics; optionally save JSON with energy, theta, operators
+
+if __name__ == "__main__":
+    main()
+```
+
+
+# ==================================
+# scripts/train_meta_lstm.py
+# ==================================
+
+```pseudo
+function _omega_schedule(t, T, schedule, alpha):
+    if uniform: weights = ones
+    if linear: weights = linspace(0..1)
+    if exp: weights = exp(alpha * linspace(0..1))
+    if final: weights = all zero except last
+    normalize weights to sum=1
+
+function main():
+    parse args: episodes, depth, T_start/T_max, meta_hidden, meta_r,
+                omega_schedule/alpha, seed, parameter ranges, out path
+    require torch
+
+    rng = Random(seed); estimator = StatevectorEstimator()
+    model = CoordinateWiseLSTM(hidden_size, input_size=2)
+    optimizer = Adam(model.params, lr=0.003)
+
+    for each episode:
+        sample t,u,dv from ranges
+        qubit_op = build_qubit_hamiltonian(t,u,dv)
+        pool = build_operator_pool_from_hamiltonian(qubit_op)
+        ops = random choice of pool (size=depth)
+
+        reference = build_reference_state(num_qubits, [0,2])
+        circuit, params = build_adapt_circuit(reference, ops)
+        define energy_fn and grad_fn via parameter_shift_grad
+
+        choose T between T_start and T_max
+        omega = _omega_schedule(episode, T, schedule, alpha)
+
+        theta = zeros(depth) + small noise (torch)
+        state = None; loss = 0
+        for step in 0..T:
+            energy = energy_fn(theta)
+            grad = grad_fn(theta)
+            surrogate = energy + dot(theta - stopgrad(theta), grad)
+            loss += omega[step] * surrogate
+            if step == T: break
+            x = preprocess_gradients_torch(grad, r=meta_r)
+            delta, state = model(x, state)
+            theta = theta + delta
+
+        backprop loss, optimizer.step()
+        print progress every 10 episodes
+
+    save_meta_lstm(out, model, config)
+```
+
+
+# =============================================
+# Tests (pydephasing/quantum/vqe/test_*.py)
+# =============================================
+
+```pseudo
+test_ansatz_parameter_shift_matches_finite_diff:
+    build small ADAPT circuit with 2 operators
+    define energy via statevector expectation
+    compare parameter_shift_grad vs finite-diff gradients
+
+test_cse_density_pool_size_dimer:
+    build 2-site fermionic Hubbard
+    build CSE density pool and assert non-empty
+
+test_cse_density_pool_gradient_nonzero:
+    build qubit Hamiltonian and CSE pool
+    compute grouped gradients with empty theta
+    assert max |grad| > 0
+```
+
+
 # =============================================
 # pydephasing/quantum/ibm_runtime_tools.py
 # =============================================
@@ -931,6 +1326,19 @@ Pseudocode representation of their structure:
 }
 ```
 
+ADAPT-VQE run outputs (from `run_adapt_meta.py --save`) follow:
+
+```pseudo
+{
+  "energy": float,
+  "theta": [ list of floats ],
+  "operators": [ list of chosen pool operators ]
+}
+```
+
+Meta-optimizer weights (from `scripts/train_meta_lstm.py`) are saved as a Torch
+checkpoint containing `state_dict` and `config` (e.g., `weights/meta_lstm_hubbard_dimer.pt`).
+
 
 # ==================================
 # Dependencies (from requirements)
@@ -942,6 +1350,7 @@ Key dependencies actually used by the code in this repo:
 - `qiskit-aer` (noise + Aer estimators),
 - `qiskit-nature` (FermionicOp, UCCSD, HartreeFock),
 - `numpy`, `scipy`.
+- `torch` (optional, only for meta-optimizer training/inference).
 
 The requirements file lists more libraries than the code currently uses.
 
@@ -955,8 +1364,9 @@ A simple way to think about the repository:
 1) Build a Hubbard model in second quantization.
 2) Map to qubits using Jordan-Wigner.
 3) Select a parametric ansatz circuit.
-4) Use VQE to minimize energy using local statevector or IBM runtime estimators.
-5) Compare to exact diagonalization for validation.
+4) Use VQE or ADAPT-VQE to minimize energy using local statevector or IBM runtime estimators.
+5) (Optional) Replace or warm-start the inner optimizer with a meta-learned LSTM.
+6) Compare to exact diagonalization for validation.
 
 The main script (`hubbard_jw_check.py`) is the orchestrator for all of this.
 It is also the most important file to read to understand how the project fits together.
@@ -975,4 +1385,7 @@ It is also the most important file to read to understand how the project fits to
 - The optimization on hardware is a simple stochastic search (not gradient-based).
 - The local statevector VQE is used both for a quick check and as a warm start
   to set parameters for IBM runs.
-
+- ADAPT-VQE uses parameter-shift probes to select operators from a pool; a CSE
+  density-operator pool is available for grouped generators.
+- Meta-ADAPT-VQE can use a Torch LSTM model, a NumPy-only LSTM weight file, or a
+  hybrid warmup + L-BFGS-B inner loop.
