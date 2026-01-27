@@ -1,0 +1,7 @@
+{"iter": 0, "energy": 4.0, "max_grad": null, "chosen_op": null, "t_iter_s": 0.0, "t_cum_s": 0.0, "ansatz_len": 0, "n_params": 0, "pool_size": 8}
+{"iter": 1, "energy": -0.23606797749969366, "max_grad": 0.9999999999999998, "chosen_op": "gamma(+_3 -_4)", "t_iter_s": 1.3077478748746216, "t_cum_s": 1.3077478748746216, "ansatz_len": 1, "n_params": 1, "pool_size": 7}
+{"iter": 2, "energy": -0.49999933198127655, "max_grad": 0.9999999999999998, "chosen_op": "gamma(+_0 -_1)", "t_iter_s": 4.247843666933477, "t_cum_s": 5.5555915418080986, "ansatz_len": 2, "n_params": 2, "pool_size": 6}
+{"iter": 3, "energy": -1.564149060524977, "max_grad": 0.9332094759310774, "chosen_op": "gamma(+_4 -_5)", "t_iter_s": 21.848326165694743, "t_cum_s": 27.403917707502842, "ansatz_len": 3, "n_params": 3, "pool_size": 5}
+{"iter": 4, "energy": -1.6505735036871767, "max_grad": 0.21285654128773024, "chosen_op": "gamma(+_1 -_2)", "t_iter_s": 18.126086082775146, "t_cum_s": 45.53000379027799, "ansatz_len": 4, "n_params": 4, "pool_size": 4}
+{"iter": 5, "energy": -1.6477950484384998, "max_grad": 0.033707984653854314, "chosen_op": "gamma(+_5 -_4)", "t_iter_s": 35.954936834052205, "t_cum_s": 81.48494062433019, "ansatz_len": 5, "n_params": 5, "pool_size": 3}
+{"iter": 6, "energy": -1.6493995007264959, "max_grad": 0.036685071954072085, "chosen_op": "gamma(+_1 -_0)", "t_iter_s": 40.61859504226595, "t_cum_s": 122.10353566659614, "ansatz_len": 6, "n_params": 6, "pool_size": 2}

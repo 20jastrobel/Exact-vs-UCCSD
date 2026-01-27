@@ -1,0 +1,109 @@
+[
+  {
+    "sites": 2,
+    "ansatz": "adapt_cse_hybrid",
+    "energy": -0.506312970694071,
+    "exact": -0.8360571181551805,
+    "delta_e": 0.32974414746110947
+  },
+  {
+    "sites": 2,
+    "ansatz": "clustered",
+    "energy": -0.7036308346779483,
+    "exact": -0.8360571181551805,
+    "delta_e": 0.13242628347723218
+  },
+  {
+    "sites": 2,
+    "ansatz": "efficient_su2",
+    "energy": -0.8589290306147261,
+    "exact": -0.8360571181551805,
+    "delta_e": -0.022871912459545674
+  },
+  {
+    "sites": 2,
+    "ansatz": "hea",
+    "energy": -1.0281373107996126,
+    "exact": -0.8360571181551805,
+    "delta_e": -0.1920801926444321
+  },
+  {
+    "sites": 2,
+    "ansatz": "uccsd",
+    "energy": -0.8360564697358668,
+    "exact": -0.8360571181551805,
+    "delta_e": 6.484193136868655e-07
+  },
+  {
+    "sites": 3,
+    "ansatz": "adapt_cse_hybrid",
+    "energy": -1.6504056667707165,
+    "exact": -1.9999999999999991,
+    "delta_e": 0.3495943332292826
+  },
+  {
+    "sites": 3,
+    "ansatz": "clustered",
+    "energy": -0.9500995277229254,
+    "exact": -1.9999999999999991,
+    "delta_e": 1.0499004722770737
+  },
+  {
+    "sites": 3,
+    "ansatz": "efficient_su2",
+    "energy": -1.051466565392246,
+    "exact": -1.9999999999999991,
+    "delta_e": 0.9485334346077532
+  },
+  {
+    "sites": 3,
+    "ansatz": "hea",
+    "energy": -1.3134425096056426,
+    "exact": -1.9999999999999991,
+    "delta_e": 0.6865574903943565
+  },
+  {
+    "sites": 3,
+    "ansatz": "uccsd",
+    "energy": null,
+    "exact": -1.9999999999999991,
+    "delta_e": null,
+    "error": "UCCSD expects num_qubits == 2 * num_spatial_orbitals; got num_qubits=6, num_spatial_orbitals=2."
+  },
+  {
+    "sites": 4,
+    "ansatz": "adapt_cse_hybrid",
+    "energy": -2.343824284429843,
+    "exact": -2.6249422715108635,
+    "delta_e": 0.28111798708102054
+  },
+  {
+    "sites": 4,
+    "ansatz": "clustered",
+    "energy": -0.9111877630484235,
+    "exact": -2.6249422715108635,
+    "delta_e": 1.71375450846244
+  },
+  {
+    "sites": 4,
+    "ansatz": "efficient_su2",
+    "energy": -0.7218941374886845,
+    "exact": -2.6249422715108635,
+    "delta_e": 1.903048134022179
+  },
+  {
+    "sites": 4,
+    "ansatz": "hea",
+    "energy": -1.3936439250472414,
+    "exact": -2.6249422715108635,
+    "delta_e": 1.231298346463622
+  },
+  {
+    "sites": 4,
+    "ansatz": "uccsd",
+    "energy": null,
+    "exact": -2.6249422715108635,
+    "delta_e": null,
+    "error": "UCCSD expects num_qubits == 2 * num_spatial_orbitals; got num_qubits=8, num_spatial_orbitals=2."
+  }
+]

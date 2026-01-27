@@ -26,7 +26,7 @@ from pydephasing.quantum.vqe.meta_lstm import (
 )
 
 
-def _omega_schedule(t: int, T: int, schedule: str, alpha: float) -> np.ndarray:
+def _omega_schedule(t: int, T: int, schedule: str, alpha: float, warm_steps: int) -> np.ndarray:
     if schedule == "uniform":
         weights = np.ones(T + 1, dtype=float)
     elif schedule == "linear":
@@ -34,9 +34,16 @@ def _omega_schedule(t: int, T: int, schedule: str, alpha: float) -> np.ndarray:
     elif schedule == "exp":
         grid = np.linspace(0.0, 1.0, T + 1, dtype=float)
         weights = np.exp(alpha * grid)
-    elif schedule == "final":
+    elif schedule == "final_only":
         weights = np.zeros(T + 1, dtype=float)
         weights[-1] = 1.0
+    elif schedule == "two_phase":
+        weights = np.zeros(T + 1, dtype=float)
+        start = min(max(0, warm_steps), T)
+        if start < T:
+            weights[start:] = np.linspace(0.0, 1.0, T + 1 - start, dtype=float)
+        else:
+            weights[-1] = 1.0
     else:
         raise ValueError(f"Unknown omega schedule: {schedule}")
     total = float(np.sum(weights))
@@ -57,8 +64,14 @@ def main() -> None:
     parser.add_argument("--T-max", type=int, default=10)
     parser.add_argument("--meta-hidden", type=int, default=20)
     parser.add_argument("--meta-r", type=float, default=10.0)
-    parser.add_argument("--omega-schedule", type=str, default="final", choices=["uniform", "linear", "exp", "final"])
+    parser.add_argument(
+        "--omega-schedule",
+        type=str,
+        default="two_phase",
+        choices=["uniform", "linear", "exp", "final_only", "two_phase"],
+    )
     parser.add_argument("--omega-alpha", type=float, default=4.0)
+    parser.add_argument("--omega-warm-steps", type=int, default=3)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--t-range", type=float, nargs=2, default=[0.5, 1.5])
     parser.add_argument("--u-range", type=float, nargs=2, default=[2.0, 6.0])
@@ -97,7 +110,7 @@ def main() -> None:
 
         T = args.T_start + int((episode / max(1, args.episodes - 1)) * (args.T_max - args.T_start))
         T = max(args.T_start, min(args.T_max, T))
-        omega = _omega_schedule(episode, T, args.omega_schedule, args.omega_alpha)
+        omega = _omega_schedule(episode, T, args.omega_schedule, args.omega_alpha, args.omega_warm_steps)
 
         theta = torch.zeros((args.depth,), dtype=torch.float32, requires_grad=True)
         theta = theta + 0.05 * torch.randn_like(theta)

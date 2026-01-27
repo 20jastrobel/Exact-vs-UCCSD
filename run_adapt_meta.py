@@ -5,6 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import platform
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
 from typing import Sequence
 
 import numpy as np
@@ -22,6 +27,10 @@ from pydephasing.quantum.vqe.adapt_vqe_meta import (
 )
 from pydephasing.quantum.vqe.meta_lstm_optimizer import CoordinateWiseLSTMOptimizer
 from pydephasing.quantum.vqe.meta_lstm import load_meta_lstm, CoordinateWiseLSTM
+from pydephasing.quantum.symmetry import (
+    exact_ground_energy_sector,
+    map_symmetry_ops_to_qubits,
+)
 
 
 def _parse_occ_list(value: str | None) -> list[int]:
@@ -54,6 +63,77 @@ def _save_result(path: str, energy: float, params: Sequence[float], operators: S
         json.dump(payload, f, indent=2)
 
 
+class RunLogger:
+    def __init__(self, run_dir: Path):
+        self.run_dir = Path(run_dir)
+        self.path = self.run_dir / "history.jsonl"
+        self.f = open(self.path, "a", buffering=1)
+        self.t_cum = 0.0
+        self._t0 = None
+
+    def log_point(self, *, it, energy, max_grad=None, chosen_op=None,
+                  t_iter_s=None, t_cum_s=None, extra=None):
+        row = {
+            "iter": int(it),
+            "energy": float(energy),
+            "max_grad": None if max_grad is None else float(max_grad),
+            "chosen_op": None if chosen_op is None else str(chosen_op),
+            "t_iter_s": None if t_iter_s is None else float(t_iter_s),
+            "t_cum_s": None if t_cum_s is None else float(t_cum_s),
+        }
+        if extra:
+            row.update(extra)
+        self.f.write(json.dumps(row) + "\n")
+
+    def start_iter(self):
+        self._t0 = time.perf_counter()
+
+    def end_iter(self):
+        dt = time.perf_counter() - self._t0
+        self.t_cum += dt
+        return dt, self.t_cum
+
+    def close(self):
+        self.f.close()
+
+
+def make_run_dir_and_meta(args) -> Path:
+    run_id = getattr(args, "run_id", None) or datetime.now().strftime("%Y%m%d_%H%M%S")
+    logdir = Path(getattr(args, "logdir", "runs"))
+    run_dir = logdir / f"{run_id}_L{args.sites}_Nup{args.n_up}_Ndown{args.n_down}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    meta = {
+        "run_id": run_id,
+        "sites": args.sites,
+        "n_up": args.n_up,
+        "n_down": args.n_down,
+        "pool": getattr(args, "pool", None),
+        "inner_optimizer": getattr(args, "inner_optimizer", None),
+        "max_depth": getattr(args, "max_depth", None),
+        "eps_grad": getattr(args, "eps_grad", None),
+        "eps_energy": getattr(args, "eps_energy", None),
+        "ham_params": {
+            "t": getattr(args, "t", None),
+            "u": getattr(args, "u", None),
+            "dv": getattr(args, "dv", None),
+        },
+        "exact_energy": None,
+        "python": sys.version,
+        "platform": platform.platform(),
+    }
+    (run_dir / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True))
+    print(f"[log] run_dir = {run_dir}")
+    return run_dir
+
+
+def update_meta_exact_energy(run_dir: Path, exact_energy: float):
+    p = run_dir / "meta.json"
+    meta = json.loads(p.read_text())
+    meta["exact_energy"] = float(exact_energy)
+    p.write_text(json.dumps(meta, indent=2, sort_keys=True))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Meta-ADAPT-VQE for 2-site Hubbard (4 qubits) using StatevectorEstimator."
@@ -67,7 +147,9 @@ def main() -> None:
     parser.add_argument("--eps-grad", type=float, default=1e-4)
     parser.add_argument("--eps-energy", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=11)
-    parser.add_argument("--occ", type=str, default="0,2")
+    parser.add_argument("--occ", type=str, default="")
+    parser.add_argument("--n-up", type=int, default=None)
+    parser.add_argument("--n-down", type=int, default=None)
     parser.add_argument(
         "--inner-optimizer",
         type=str,
@@ -85,9 +167,18 @@ def main() -> None:
     parser.add_argument("--meta-dtheta-clip", type=float, default=0.25)
     parser.add_argument("--meta-hidden", type=int, default=20)
     parser.add_argument("--meta-r", type=float, default=10.0)
+    parser.add_argument("--meta-alpha0", type=float, default=1.0)
+    parser.add_argument("--meta-alpha-k", type=float, default=0.5)
+    parser.add_argument("--warmup-steps", type=int, default=5)
+    parser.add_argument("--polish-steps", type=int, default=3)
+    parser.add_argument("--logdir", type=str, default="runs")
+    parser.add_argument("--run-id", type=str, default=None)
+    parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--theta-init-noise", type=float, default=0.0)
     parser.add_argument("--lbfgs-restarts", type=int, default=3)
     parser.add_argument("--allow-repeats", action="store_true")
+    parser.add_argument("--enforce-sector", action="store_true", default=True)
+    parser.add_argument("--no-enforce-sector", dest="enforce_sector", action="store_false")
     parser.add_argument(
         "--pool",
         type=str,
@@ -109,8 +200,26 @@ def main() -> None:
     qubit_op, _mapper = build_qubit_hamiltonian_from_fermionic(ferm_op)
     exact = exact_ground_energy(qubit_op)
 
+    if args.n_up is None or args.n_down is None:
+        if args.n_up is None and args.n_down is None:
+            args.n_up = args.sites // 2
+            args.n_down = args.sites // 2
+        else:
+            raise ValueError("Both --n-up and --n-down must be set together.")
+
     occupations = _parse_occ_list(args.occ)
+    if not occupations:
+        occupations = list(range(args.n_up)) + list(range(args.sites, args.sites + args.n_down))
+    else:
+        n_up = sum(1 for idx in occupations if idx < args.sites)
+        n_down = sum(1 for idx in occupations if idx >= args.sites)
+        if n_up != args.n_up or n_down != args.n_down:
+            raise ValueError("Provided --occ does not match --n-up/--n-down sector.")
+
     reference_state = build_reference_state(qubit_op.num_qubits, occupations)
+
+    run_dir = make_run_dir_and_meta(args)
+    logger = RunLogger(run_dir)
 
     warned_missing_weights = False
     meta_model = None
@@ -150,13 +259,14 @@ def main() -> None:
                 "Meta-optimizer weights not provided; using random init "
                 "(expected poor performance)."
             )
-        try:
-            meta_model = CoordinateWiseLSTM(hidden_size=args.meta_hidden, input_size=2)
-        except Exception as exc:
-            raise RuntimeError(
-                "Torch is required for meta/hybrid inner optimization. "
-                "Install torch or choose --inner-optimizer lbfgs."
-            ) from exc
+        if args.inner_optimizer == "meta":
+            try:
+                meta_model = CoordinateWiseLSTM(hidden_size=args.meta_hidden, input_size=2)
+            except Exception as exc:
+                raise RuntimeError(
+                    "Torch is required for meta inner optimization. "
+                    "Install torch or choose --inner-optimizer lbfgs/hybrid."
+                ) from exc
 
     weights = None
     if args.weights and args.weights.endswith(".npz"):
@@ -164,12 +274,13 @@ def main() -> None:
     lstm = CoordinateWiseLSTMOptimizer(seed=args.seed, weights=weights) if weights else CoordinateWiseLSTMOptimizer(seed=args.seed)
 
     estimator = StatevectorEstimator()
-    result = run_meta_adapt_vqe(
-        qubit_op,
-        reference_state,
-        estimator,
-        max_depth=args.max_depth,
-        inner_steps=args.inner_steps,
+    try:
+        result = run_meta_adapt_vqe(
+            qubit_op,
+            reference_state,
+            estimator,
+            max_depth=args.max_depth,
+            inner_steps=args.inner_steps,
         eps_grad=args.eps_grad,
         eps_energy=args.eps_energy,
         lstm_optimizer=lstm,
@@ -178,6 +289,10 @@ def main() -> None:
         pool_mode=args.pool,
         ferm_op=ferm_op,
         mapper=_mapper,
+        n_sites=args.sites,
+        n_up=args.n_up,
+        n_down=args.n_down,
+        enforce_sector=args.enforce_sector,
         r=args.meta_r,
         inner_optimizer=args.inner_optimizer,
         theta_bound=args.theta_bound,
@@ -188,14 +303,30 @@ def main() -> None:
         lbfgs_restarts=args.lbfgs_restarts,
         theta_init_noise=args.theta_init_noise,
         allow_repeats=args.allow_repeats,
-        verbose=not args.quiet,
-    )
+        warmup_steps=args.warmup_steps,
+        polish_steps=args.polish_steps,
+            meta_alpha0=args.meta_alpha0,
+            meta_alpha_k=args.meta_alpha_k,
+            logger=logger,
+            log_every=args.log_every,
+            verbose=not args.quiet,
+        )
+    finally:
+        logger.close()
 
     print("Meta-ADAPT-VQE (Statevector)")
     print(f"t={args.t}, U={args.u}, dv={args.dv}")
-    print(f"Exact ground energy: {exact:.8f}")
-    print(f"Meta-ADAPT energy:  {result.energy:.8f}")
-    print(f"Abs diff:           {abs(result.energy - exact):.8e}")
+    exact_sector = exact_ground_energy_sector(
+        qubit_op,
+        args.sites,
+        args.n_up + args.n_down,
+        0.5 * (args.n_up - args.n_down),
+    )
+    update_meta_exact_energy(run_dir, exact_sector)
+    print(f"Exact ground energy (full):   {exact:.8f}")
+    print(f"Exact ground energy (sector): {exact_sector:.8f}")
+    print(f"Meta-ADAPT energy:            {result.energy:.8f}")
+    print(f"Abs diff (sector):            {abs(result.energy - exact_sector):.8e}")
     print(f"Depth:              {len(result.operators)}")
     if result.diagnostics.get("outer"):
         first = result.diagnostics["outer"][0]
@@ -222,14 +353,32 @@ def main() -> None:
         elif last.get("inner_optimizer") == "hybrid":
             stats = last.get("inner_stats") or {}
             meta_stats = stats.get("meta", {})
-            lbfgs_stats = stats.get("lbfgs", {})
+            warm_stats = stats.get("warm", {})
+            polish_stats = stats.get("polish", {})
             print(f"meta avg||Δθ||:     {meta_stats.get('avg_delta_norm')}")
-            print(f"lbfgs nfev:         {lbfgs_stats.get('nfev')}")
-            print(f"lbfgs restarts:     {lbfgs_stats.get('restarts')}")
+            print(f"warm nfev:          {warm_stats.get('nfev')}")
+            print(f"polish nfev:        {polish_stats.get('nfev')}")
 
     if args.save:
         _save_result(args.save, result.energy, result.params, result.operators)
         print(f"Saved: {args.save}")
+
+    if args.enforce_sector:
+        n_q, sz_q = map_symmetry_ops_to_qubits(_mapper, args.sites)
+        from qiskit.quantum_info import Statevector
+        from pydephasing.quantum.vqe.adapt_vqe_meta import build_adapt_circuit, build_adapt_circuit_grouped
+        if args.pool == "cse_density_ops":
+            circuit, params = build_adapt_circuit_grouped(reference_state, result.operators)
+        else:
+            circuit, params = build_adapt_circuit(reference_state, result.operators)
+        bound = circuit.assign_parameters({p: v for p, v in zip(params, result.params)}, inplace=False)
+        state = Statevector.from_instruction(bound)
+        n_val = float(np.real(state.expectation_value(n_q)))
+        sz_val = float(np.real(state.expectation_value(sz_q)))
+        if abs(n_val - (args.n_up + args.n_down)) > 1e-6 or abs(sz_val - 0.5 * (args.n_up - args.n_down)) > 1e-6:
+            raise RuntimeError("Statevector left target sector.")
+        if result.energy < exact_sector - 1e-9:
+            raise RuntimeError("VQE energy below exact sector energy.")
 
 
 if __name__ == "__main__":

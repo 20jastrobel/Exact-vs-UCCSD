@@ -17,13 +17,14 @@ from qiskit_nature.second_q.mappers import JordanWignerMapper
 
 from .meta_lstm_optimizer import CoordinateWiseLSTMOptimizer, LSTMState
 from .meta_lstm import preprocess_gradients_torch
+from ..symmetry import commutes, map_symmetry_ops_to_qubits
 
 
 @dataclass
 class MetaAdaptVQEResult:
     energy: float
     params: list[float]
-    operators: list[str]
+    operators: list
     diagnostics: dict
 
 
@@ -73,6 +74,8 @@ def build_cse_density_pool_from_fermionic(
     *,
     include_diagonal: bool = False,
     dedup_tol: float = 1e-12,
+    enforce_symmetry: bool = False,
+    n_sites: int | None = None,
 ) -> list[dict]:
     """Return CSE-inspired density operator pool from a fermionic Hamiltonian."""
     if ferm_op is None:
@@ -89,8 +92,14 @@ def build_cse_density_pool_from_fermionic(
             q = int(terms[1][2:])
             if p == q and not include_diagonal:
                 continue
+            if enforce_symmetry and n_sites is not None:
+                if not _fermionic_term_in_sector(label, n_sites):
+                    continue
             gamma = FermionicOp({label: 1.0}, num_spin_orbitals=ferm_op.num_spin_orbitals)
         elif include_diagonal and len(terms) in (4,):
+            if enforce_symmetry and n_sites is not None:
+                if not _fermionic_term_in_sector(label, n_sites):
+                    continue
             gamma = FermionicOp({label: 1.0}, num_spin_orbitals=ferm_op.num_spin_orbitals)
         else:
             continue
@@ -134,6 +143,22 @@ def build_cse_density_pool_from_fermionic(
         )
 
     return pool
+
+
+def _fermionic_term_in_sector(label: str, n_sites: int) -> bool:
+    terms = label.split()
+    delta_n = 0
+    delta_sz = 0.0
+    for term in terms:
+        if term.startswith("+_"):
+            idx = int(term[2:])
+            delta_n += 1
+            delta_sz += 0.5 if idx < n_sites else -0.5
+        elif term.startswith("-_"):
+            idx = int(term[2:])
+            delta_n -= 1
+            delta_sz -= 0.5 if idx < n_sites else -0.5
+    return delta_n == 0 and abs(delta_sz) < 1e-12
 
 
 def build_reference_state(num_qubits: int, occupations: Sequence[int]) -> QuantumCircuit:
@@ -369,6 +394,8 @@ def _meta_optimize(
     r: float,
     step_scale: float,
     dtheta_clip: float | None,
+    alpha0: float = 1.0,
+    alpha_k: float = 0.0,
     verbose: bool,
 ) -> tuple[np.ndarray, dict]:
     torch = _maybe_import_torch()
@@ -398,7 +425,8 @@ def _meta_optimize(
 
         if dtheta_clip is not None:
             delta = np.clip(delta, -dtheta_clip, dtheta_clip)
-        delta = step_scale * delta
+        alpha = alpha0 * (1.0 + alpha_k * (inner_idx / max(1, steps - 1)))
+        delta = alpha * step_scale * delta
 
         theta = theta + delta
 
@@ -475,6 +503,10 @@ def run_meta_adapt_vqe(
     ferm_op: FermionicOp | None = None,
     mapper: JordanWignerMapper | None = None,
     cse_include_diagonal: bool = False,
+    n_sites: int | None = None,
+    n_up: int | None = None,
+    n_down: int | None = None,
+    enforce_sector: bool = False,
     max_depth: int = 20,
     inner_steps: int = 30,
     eps_grad: float = 1e-4,
@@ -495,10 +527,22 @@ def run_meta_adapt_vqe(
     lbfgs_restarts: int = 1,
     theta_init_noise: float = 0.0,
     allow_repeats: bool = False,
+    warmup_steps: int = 5,
+    polish_steps: int = 3,
+    meta_alpha0: float = 1.0,
+    meta_alpha_k: float = 0.0,
+    logger=None,
+    log_every: int = 1,
     verbose: bool = True,
 ) -> MetaAdaptVQEResult:
     pool_specs: list[dict] | None = None
     pool_labels: list[str] | None = None
+    n_q = None
+    sz_q = None
+    if enforce_sector:
+        if mapper is None or n_sites is None:
+            raise ValueError("mapper and n_sites are required when enforce_sector is True.")
+        n_q, sz_q = map_symmetry_ops_to_qubits(mapper, n_sites)
 
     if pool_mode == "cse_density_ops":
         if pool is not None:
@@ -510,15 +554,35 @@ def run_meta_adapt_vqe(
                 ferm_op,
                 mapper,
                 include_diagonal=cse_include_diagonal,
+                enforce_symmetry=enforce_sector,
+                n_sites=n_sites,
             )
         if not pool_specs:
             raise ValueError("Operator pool is empty.")
+        if enforce_sector and n_q is not None and sz_q is not None:
+            filtered = []
+            for spec in pool_specs:
+                op = SparsePauliOp.from_list(spec["paulis"])
+                if commutes(op, n_q) and commutes(op, sz_q):
+                    filtered.append(spec)
+            pool_specs = filtered
+            if not pool_specs:
+                raise ValueError("Operator pool empty after symmetry filtering.")
     else:
         if pool is None:
             pool = build_operator_pool_from_hamiltonian(qubit_op, mode=pool_mode)
         pool_labels = list(pool)
         if not pool_labels:
             raise ValueError("Operator pool is empty.")
+        if enforce_sector and n_q is not None and sz_q is not None:
+            filtered = []
+            for label in pool_labels:
+                op = SparsePauliOp.from_list([(label, 1.0)])
+                if commutes(op, n_q) and commutes(op, sz_q):
+                    filtered.append(label)
+            pool_labels = filtered
+            if not pool_labels:
+                raise ValueError("Operator pool empty after symmetry filtering.")
 
     if lstm_optimizer is None:
         lstm_optimizer = CoordinateWiseLSTMOptimizer(seed=seed)
@@ -539,7 +603,24 @@ def run_meta_adapt_vqe(
 
     shift, coeff = _probe_shift_and_coeff(probe_convention)
 
+    if logger is not None:
+        logger.log_point(
+            it=0,
+            energy=energy_current,
+            max_grad=None,
+            chosen_op=None,
+            t_iter_s=0.0,
+            t_cum_s=0.0,
+            extra={
+                "ansatz_len": 0,
+                "n_params": 0,
+                "pool_size": len(pool_specs) if pool_specs is not None else len(pool_labels),
+            },
+        )
+
     for outer_idx in range(max_depth):
+        if logger is not None:
+            logger.start_iter()
         if pool_mode == "cse_density_ops":
             circuit, _params = build_adapt_circuit_grouped(reference_state, ops)
         else:
@@ -579,10 +660,42 @@ def run_meta_adapt_vqe(
                 print(
                     f"ADAPT stop: |ΔE|={abs(energy_current - prev_energy):.3e} < {eps_energy}"
                 )
+            if logger is not None:
+                dt, tc = logger.end_iter()
+                if (outer_idx + 1) % max(1, log_every) == 0:
+                    logger.log_point(
+                        it=outer_idx + 1,
+                        energy=energy_current,
+                        max_grad=max_abs_grad,
+                        chosen_op=None,
+                        t_iter_s=dt,
+                        t_cum_s=tc,
+                        extra={
+                            "ansatz_len": len(ops),
+                            "n_params": len(theta),
+                            "pool_size": len(pool_specs) if pool_specs is not None else len(pool_labels),
+                        },
+                    )
             break
         if max_abs_grad < eps_grad:
             if verbose:
                 print(f"ADAPT stop: max|g|={max_abs_grad:.3e} < {eps_grad}")
+            if logger is not None:
+                dt, tc = logger.end_iter()
+                if (outer_idx + 1) % max(1, log_every) == 0:
+                    logger.log_point(
+                        it=outer_idx + 1,
+                        energy=energy_current,
+                        max_grad=max_abs_grad,
+                        chosen_op=None,
+                        t_iter_s=dt,
+                        t_cum_s=tc,
+                        extra={
+                            "ansatz_len": len(ops),
+                            "n_params": len(theta),
+                            "pool_size": len(pool_specs) if pool_specs is not None else len(pool_labels),
+                        },
+                    )
             break
 
         if pool_mode == "cse_density_ops":
@@ -642,6 +755,8 @@ def run_meta_adapt_vqe(
                 r=r,
                 step_scale=meta_step_scale,
                 dtheta_clip=meta_dtheta_clip,
+                alpha0=meta_alpha0,
+                alpha_k=meta_alpha_k,
                 verbose=verbose,
             )
         elif inner_optimizer == "lbfgs":
@@ -655,22 +770,84 @@ def run_meta_adapt_vqe(
                 rng=rng,
             )
         elif inner_optimizer == "hybrid":
-            if meta_model is None:
-                raise RuntimeError("Hybrid optimizer requested without a loaded model.")
-            theta, inner_stats = _hybrid_optimize(
+            warm_steps = max(0, min(inner_steps, warmup_steps))
+            meta_steps = max(0, inner_steps - warm_steps)
+
+            theta_warm, warm_stats = _lbfgs_optimize(
                 theta,
                 energy_fn,
                 grad_fn,
-                model=meta_model,
-                r=r,
-                step_scale=meta_step_scale,
-                dtheta_clip=meta_dtheta_clip,
-                warmup_steps=meta_warmup_steps,
                 theta_bound=theta_bound,
-                lbfgs_maxiter=lbfgs_maxiter,
-                lbfgs_restarts=lbfgs_restarts,
-                verbose=verbose,
+                maxiter=warm_steps if warm_steps > 0 else None,
+                restarts=1,
+                rng=rng,
             )
+            if verbose and warm_steps > 0:
+                e_warm = energy_fn(theta_warm)
+                g_warm = grad_fn(theta_warm)
+                print(
+                    f"  warm-start: E={e_warm:.10f}, ||g||={np.linalg.norm(g_warm):.3e}, "
+                    f"max|g|={np.max(np.abs(g_warm)):.3e}"
+                )
+
+            theta_meta = theta_warm.copy()
+            delta_norms = []
+            if meta_steps > 0:
+                if meta_model is not None:
+                    torch = _maybe_import_torch()
+                    device = next(meta_model.parameters()).device
+                    meta_model.eval()
+                    n_params = theta_meta.size
+                    h = torch.zeros((n_params, meta_model.hidden_size), device=device)
+                    c = torch.zeros((n_params, meta_model.hidden_size), device=device)
+
+                    for step_idx in range(meta_steps):
+                        grad = grad_fn(theta_meta)
+                        x = preprocess_gradients_torch(grad, r=r, device=device)
+                        with torch.no_grad():
+                            delta, (h, c) = meta_model(x, (h, c))
+                        delta = delta.cpu().numpy().astype(float)
+                        if meta_dtheta_clip is not None:
+                            delta = np.clip(delta, -meta_dtheta_clip, meta_dtheta_clip)
+                        alpha = meta_alpha0 * (1.0 + meta_alpha_k * (step_idx / max(1, meta_steps - 1)))
+                        delta = alpha * delta
+                        theta_meta = theta_meta + delta
+                        delta_norms.append(float(np.linalg.norm(delta)))
+                else:
+                    for step_idx in range(meta_steps):
+                        grad = grad_fn(theta_meta)
+                        delta = -grad
+                        if meta_dtheta_clip is not None:
+                            delta = np.clip(delta, -meta_dtheta_clip, meta_dtheta_clip)
+                        alpha = meta_alpha0 * (1.0 + meta_alpha_k * (step_idx / max(1, meta_steps - 1)))
+                        delta = alpha * delta
+                        theta_meta = theta_meta + delta
+                        delta_norms.append(float(np.linalg.norm(delta)))
+
+            meta_stats = {"avg_delta_norm": float(np.mean(delta_norms)) if delta_norms else 0.0}
+
+            theta_polish, polish_stats = _lbfgs_optimize(
+                theta_meta,
+                energy_fn,
+                grad_fn,
+                theta_bound=theta_bound,
+                maxiter=polish_steps if polish_steps > 0 else None,
+                restarts=1,
+                rng=rng,
+            )
+            if verbose and polish_steps > 0:
+                e_polish = energy_fn(theta_polish)
+                g_polish = grad_fn(theta_polish)
+                print(
+                    f"  polish: E={e_polish:.10f}, ||g||={np.linalg.norm(g_polish):.3e}, "
+                    f"max|g|={np.max(np.abs(g_polish)):.3e}"
+                )
+            theta = theta_polish
+            inner_stats = {
+                "warm": warm_stats,
+                "meta": meta_stats,
+                "polish": polish_stats,
+            }
         else:
             raise ValueError(f"Unknown inner optimizer: {inner_optimizer}")
 
@@ -679,6 +856,23 @@ def run_meta_adapt_vqe(
 
         prev_energy = energy_current
         energy_current = energy_fn(theta)
+
+        if logger is not None:
+            dt, tc = logger.end_iter()
+            if (outer_idx + 1) % max(1, log_every) == 0:
+                logger.log_point(
+                    it=outer_idx + 1,
+                    energy=energy_current,
+                    max_grad=max_abs_grad,
+                    chosen_op=chosen_op,
+                    t_iter_s=dt,
+                    t_cum_s=tc,
+                    extra={
+                        "ansatz_len": len(ops),
+                        "n_params": len(theta),
+                        "pool_size": len(pool_specs) if pool_specs is not None else len(pool_labels),
+                    },
+                )
         diagnostics["outer"].append(
             {
                 "outer_iter": len(ops),
