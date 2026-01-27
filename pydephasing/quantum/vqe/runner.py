@@ -29,6 +29,7 @@ def run_vqe_with_estimator(
     maxiter: int,
     optimizer_name: str,
     seed: int,
+    initial_point: np.ndarray | None = None,
 ) -> LocalVQEResult:
     rng = np.random.default_rng(seed)
 
@@ -38,12 +39,18 @@ def run_vqe_with_estimator(
 
     for restart_idx in range(restarts):
         optimizer = build_optimizer(optimizer_name, maxiter=maxiter)
-        initial_point = rng.random(ansatz.num_parameters) * 2 * np.pi
+        if initial_point is not None:
+            point = np.asarray(initial_point, dtype=float)
+        elif ansatz.__class__.__name__.lower() == "uccsd":
+            # UCCSD is typically initialized at the HF reference point.
+            point = np.zeros(ansatz.num_parameters, dtype=float)
+        else:
+            point = rng.random(ansatz.num_parameters) * 2 * np.pi
         vqe = VQE(
             estimator=estimator,
             ansatz=ansatz,
             optimizer=optimizer,
-            initial_point=initial_point,
+            initial_point=point,
         )
         result = vqe.compute_minimum_eigenvalue(qubit_op)
         energy = float(np.real(result.eigenvalue))
@@ -72,6 +79,7 @@ def run_local_vqe(
     maxiter: int,
     optimizer_name: str,
     seed: int,
+    initial_point: np.ndarray | None = None,
 ) -> LocalVQEResult:
     estimator = StatevectorEstimator()
     return run_vqe_with_estimator(
@@ -82,5 +90,5 @@ def run_local_vqe(
         maxiter=maxiter,
         optimizer_name=optimizer_name,
         seed=seed,
+        initial_point=initial_point,
     )
-

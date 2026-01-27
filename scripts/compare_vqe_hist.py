@@ -28,6 +28,8 @@ def sector_occ(n_sites: int, n_up: int, n_down: int) -> list[int]:
 
 def run_regular_vqe(
     *,
+    n_sites: int,
+    num_particles: tuple[int, int],
     qubit_op,
     mapper,
     ansatz_kind: str,
@@ -35,9 +37,20 @@ def run_regular_vqe(
     seed: int = 7,
 ) -> float:
     estimator = StatevectorEstimator()
-    ansatz = build_ansatz(ansatz_kind, qubit_op.num_qubits, reps, mapper)
+    ansatz = build_ansatz(
+        ansatz_kind,
+        qubit_op.num_qubits,
+        reps,
+        mapper,
+        n_sites=n_sites,
+        num_particles=num_particles,
+    )
     rng = np.random.default_rng(seed)
-    initial_point = rng.random(ansatz.num_parameters) * 2 * np.pi
+    if ansatz_kind == "uccsd":
+        # UCCSD is commonly initialized at the Hartree-Fock reference point.
+        initial_point = np.zeros(ansatz.num_parameters, dtype=float)
+    else:
+        initial_point = rng.random(ansatz.num_parameters) * 2 * np.pi
     optimizer = COBYLA(maxiter=150)
     vqe = VQE(estimator=estimator, ansatz=ansatz, optimizer=optimizer, initial_point=initial_point)
     result = vqe.compute_minimum_eigenvalue(qubit_op)
@@ -123,7 +136,13 @@ def main() -> None:
 
         for kind in ansatz_kinds:
             try:
-                e = run_regular_vqe(qubit_op=qubit_op, mapper=mapper, ansatz_kind=kind)
+                e = run_regular_vqe(
+                    n_sites=n_sites,
+                    num_particles=(n_up, n_down),
+                    qubit_op=qubit_op,
+                    mapper=mapper,
+                    ansatz_kind=kind,
+                )
             except Exception as exc:
                 rows.append(
                     {
