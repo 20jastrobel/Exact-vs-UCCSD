@@ -45,26 +45,12 @@ def _str_to_bool(value: str) -> bool:
     raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
 
-def _parse_occ_list(value: str) -> list[int]:
-    if value is None:
-        return []
-    text = value.strip()
-    if not text:
-        return []
-    items = [item.strip() for item in text.split(",") if item.strip()]
-    return [int(item) for item in items]
-
-
 def _normalize_ansatz(name: str) -> str:
-    if name in {"hea", "hardware", "hardware-efficient"}:
-        return "hea"
     return name
 
 def _default_reps(ansatz_name: str, requested: Optional[int]) -> int:
     if requested is not None:
         return requested
-    if ansatz_name in {"clustered", "efficient_su2"}:
-        return 2
     return 1
 
 
@@ -275,7 +261,14 @@ def _run_self_test() -> None:
 
     qubit_op, mapper = build_qubit_hamiltonian(1.0, 2.0, 0.5)
     exact = exact_ground_energy(qubit_op)
-    ansatz = build_ansatz("clustered", qubit_op.num_qubits, 1, mapper)
+    ansatz = build_ansatz(
+        "uccsd",
+        qubit_op.num_qubits,
+        1,
+        mapper,
+        n_sites=2,
+        num_particles=(1, 1),
+    )
     result = run_local_vqe(
         qubit_op,
         ansatz,
@@ -394,26 +387,10 @@ def main() -> None:
 
     parser.add_argument(
         "--ansatz",
-        choices=[
-            "clustered",
-            "efficient_su2",
-            "uccsd",
-            "hea",
-            "hardware",
-            "hardware-efficient",
-            "both",
-            "all",
-        ],
+        choices=["uccsd"],
         default=None,
     )
     parser.add_argument("--reps", type=int, default=None)
-    parser.add_argument("--hea-rotation", choices=["ry", "ryrz"], default="ry")
-    parser.add_argument(
-        "--hea-entanglement",
-        choices=["linear", "full", "circular"],
-        default="linear",
-    )
-    parser.add_argument("--hea-hf-occ", type=str, default="0,2")
     parser.add_argument("--self-test", action="store_true")
 
     parser.add_argument("--local-vqe", action="store_true")
@@ -485,110 +462,20 @@ def main() -> None:
 
     ibm_mode = args.ibm_sim or args.ibm_opt or args.ibm_eval or args.ibm_search
 
-    ansatz_choice = args.ansatz
-    if ansatz_choice is None:
-        if args.ibm_opt:
-            ansatz_choice = "hea"
-        elif args.ibm_sim:
-            ansatz_choice = "uccsd"
-        else:
-            ansatz_choice = "clustered"
-    ansatz_choice = _normalize_ansatz(ansatz_choice)
+    ansatz_choice = _normalize_ansatz(args.ansatz or "uccsd")
 
     qubit_op, mapper = build_qubit_hamiltonian(args.t, args.u, args.dv)
     exact = exact_ground_energy(qubit_op)
-    hea_occ = _parse_occ_list(args.hea_hf_occ)
-
-    multi_kinds: Optional[list[str]] = None
-    if ansatz_choice in {"both", "all"}:
-        if ibm_mode:
-            if args.ibm_opt:
-                ansatz_choice = "hea"
-            elif args.ibm_sim:
-                ansatz_choice = "uccsd"
-            else:
-                ansatz_choice = "clustered"
-            print(
-                "IBM mode uses a single ansatz; "
-                f"defaulting to {ansatz_choice}."
-            )
-        else:
-            multi_kinds = ["clustered", "uccsd"]
-            if ansatz_choice == "all":
-                multi_kinds.append("efficient_su2")
-
-    if multi_kinds is not None:
-        if args.load_params:
-            raise RuntimeError("--load-params cannot be used with ansatz=both/all.")
-        for kind in multi_kinds:
-            reps = _default_reps(kind, args.reps)
-            ansatz = build_ansatz(
-                kind,
-                qubit_op.num_qubits,
-                reps,
-                mapper,
-                hea_rotation=args.hea_rotation,
-                hea_entanglement=args.hea_entanglement,
-                hea_occ=hea_occ if hea_occ else None,
-            )
-            local_result = run_local_vqe(
-                qubit_op,
-                ansatz,
-                restarts=args.restarts,
-                maxiter=args.maxiter,
-                optimizer_name=args.optimizer,
-                seed=args.seed,
-            )
-            print(f"local-vqe ({kind}) best energy: {local_result.energy:.10f}")
-            print(f"exact energy:          {exact:.10f}")
-            print(f"delta:                 {local_result.energy - exact:.10e}")
-            print(f"elapsed:               {local_result.seconds:.2f}s")
-
-            if args.save_params:
-                save_params(
-                    _params_path_for_ansatz(args.save_params, kind),
-                    local_result.params,
-                    {
-                        "t": args.t,
-                        "u": args.u,
-                        "dv": args.dv,
-                        "ansatz": kind,
-                        "reps": reps,
-                    },
-                )
-        return
 
     reps = _default_reps(ansatz_choice, args.reps)
-    try:
-        ansatz = build_ansatz(
-            ansatz_choice,
-            qubit_op.num_qubits,
-            reps,
-            mapper,
-            hea_rotation=args.hea_rotation,
-            hea_entanglement=args.hea_entanglement,
-            hea_occ=hea_occ if hea_occ else None,
-        )
-    except Exception as exc:
-        if args.ibm_sim and ansatz_choice == "uccsd":
-            print(f"Warning: UCCSD failed; falling back to clustered ({exc}).")
-            ansatz_choice = "clustered"
-            reps = _default_reps(ansatz_choice, args.reps)
-            ansatz = build_ansatz(
-                ansatz_choice,
-                qubit_op.num_qubits,
-                reps,
-                mapper,
-                hea_rotation=args.hea_rotation,
-                hea_entanglement=args.hea_entanglement,
-                hea_occ=hea_occ if hea_occ else None,
-            )
-        else:
-            raise
+    ansatz = build_ansatz(
+        ansatz_choice,
+        qubit_op.num_qubits,
+        reps,
+        mapper,
+    )
 
     save_params_path = args.save_params
-    if args.ibm_opt and save_params_path is None:
-        save_params_path = "hea_ibm_params.json"
 
     if args.ibm_sim:
         _run_vqe_on_ibm_sim(
@@ -645,9 +532,6 @@ def main() -> None:
             raise RuntimeError(
                 "Set IBM_BACKEND or pass --backend to avoid API scans/timeouts."
             )
-
-        if ansatz_choice != "hea":
-            print(f"Warning: ibm-opt is intended for HEA; using {ansatz_choice}.")
 
         service = get_runtime_service()
         backend = choose_backend(

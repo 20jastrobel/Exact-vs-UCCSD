@@ -1,0 +1,19 @@
+{
+  "eps_energy": 0.001,
+  "eps_grad": 0.0001,
+  "exact_energy": -2.9951817618817382,
+  "ham_params": {
+    "dv": 0.5,
+    "t": 1.0,
+    "u": 4.0
+  },
+  "inner_optimizer": "hybrid",
+  "max_depth": 6,
+  "n_down": 1,
+  "n_up": 1,
+  "platform": "macOS-15.6.1-arm64-arm-64bit",
+  "pool": "uccsd_excitations",
+  "python": "3.10.12 (main, Jul  5 2023, 15:02:25) [Clang 14.0.6 ]",
+  "run_id": "adapt_uccsd_1769897605",
+  "sites": 5
+}

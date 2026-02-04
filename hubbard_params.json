@@ -28,6 +28,6 @@
   "t": 1.0,
   "u": 2.0,
   "dv": 0.5,
-  "ansatz": "clustered",
+  "ansatz": "uccsd",
   "reps": 2
 }

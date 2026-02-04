@@ -8,31 +8,10 @@
   },
   {
     "sites": 2,
-    "ansatz": "clustered",
-    "energy": -0.7036308346779483,
-    "exact": -0.8360571181551805,
-    "delta_e": 0.13242628347723218
-  },
-  {
-    "sites": 2,
-    "ansatz": "efficient_su2",
-    "energy": -0.8589290306147261,
-    "exact": -0.8360571181551805,
-    "delta_e": -0.022871912459545674
-  },
-  {
-    "sites": 2,
-    "ansatz": "hea",
-    "energy": -1.0281373107996126,
-    "exact": -0.8360571181551805,
-    "delta_e": -0.1920801926444321
-  },
-  {
-    "sites": 2,
     "ansatz": "uccsd",
-    "energy": -0.8360564697358668,
+    "energy": -0.836043075163397,
     "exact": -0.8360571181551805,
-    "delta_e": 6.484193136868655e-07
+    "delta_e": 1.4042991783425052e-05
   },
   {
     "sites": 3,
@@ -43,32 +22,10 @@
   },
   {
     "sites": 3,
-    "ansatz": "clustered",
-    "energy": -0.9500995277229254,
-    "exact": -1.9999999999999991,
-    "delta_e": 1.0499004722770737
-  },
-  {
-    "sites": 3,
-    "ansatz": "efficient_su2",
-    "energy": -1.051466565392246,
-    "exact": -1.9999999999999991,
-    "delta_e": 0.9485334346077532
-  },
-  {
-    "sites": 3,
-    "ansatz": "hea",
-    "energy": -1.3134425096056426,
-    "exact": -1.9999999999999991,
-    "delta_e": 0.6865574903943565
-  },
-  {
-    "sites": 3,
     "ansatz": "uccsd",
-    "energy": null,
+    "energy": -1.9794599602133123,
     "exact": -1.9999999999999991,
-    "delta_e": null,
-    "error": "UCCSD expects num_qubits == 2 * num_spatial_orbitals; got num_qubits=6, num_spatial_orbitals=2."
+    "delta_e": 0.020540039786686837
   },
   {
     "sites": 4,
@@ -78,32 +35,108 @@
     "delta_e": 0.28111798708102054
   },
   {
-    "sites": 4,
-    "ansatz": "clustered",
-    "energy": -0.9111877630484235,
-    "exact": -2.6249422715108635,
-    "delta_e": 1.71375450846244
+    "sites": 5,
+    "ansatz": "adapt_cse_hybrid",
+    "energy": -2.7199691588960224,
+    "exact": -2.9951817618817382,
+    "delta_e": 0.2752126029857158
   },
   {
-    "sites": 4,
-    "ansatz": "efficient_su2",
-    "energy": -0.7218941374886845,
-    "exact": -2.6249422715108635,
-    "delta_e": 1.903048134022179
+    "sites": 2,
+    "ansatz": "adapt_uccsd_hybrid",
+    "energy": -0.5053877824552078,
+    "exact": -0.8360571181551805,
+    "delta_e": 0.3306693356999727
   },
   {
-    "sites": 4,
-    "ansatz": "hea",
-    "energy": -1.3936439250472414,
-    "exact": -2.6249422715108635,
-    "delta_e": 1.231298346463622
+    "sites": 2,
+    "ansatz": "vqe_cse_ops",
+    "energy": -0.5063129508191968,
+    "exact": -0.8360571181551805,
+    "delta_e": 0.32974416733598366
+  },
+  {
+    "sites": 3,
+    "ansatz": "adapt_uccsd_hybrid",
+    "energy": -1.9345538084910556,
+    "exact": -1.9999999999999991,
+    "delta_e": 0.06544619150894349
+  },
+  {
+    "sites": 3,
+    "ansatz": "vqe_cse_ops",
+    "energy": -1.6523915289735505,
+    "exact": -1.9999999999999991,
+    "delta_e": 0.34760847102644865
   },
   {
     "sites": 4,
     "ansatz": "uccsd",
-    "energy": null,
+    "energy": -1.831297201866227,
     "exact": -2.6249422715108635,
-    "delta_e": null,
-    "error": "UCCSD expects num_qubits == 2 * num_spatial_orbitals; got num_qubits=8, num_spatial_orbitals=2."
+    "delta_e": 0.7936450696446364
+  },
+  {
+    "sites": 5,
+    "ansatz": "uccsd",
+    "energy": -2.6906338710955957,
+    "exact": -2.9951817618817382,
+    "delta_e": 0.3045478907861425
+  },
+  {
+    "sites": 4,
+    "ansatz": "adapt_uccsd_hybrid",
+    "energy": -2.4113939060935885,
+    "exact": -2.6249422715108635,
+    "delta_e": 0.21354836541727495
+  },
+  {
+    "sites": 4,
+    "ansatz": "vqe_cse_ops",
+    "energy": -2.351220097542356,
+    "exact": -2.6249422715108635,
+    "delta_e": 0.2737221739685074
+  },
+  {
+    "sites": 5,
+    "ansatz": "adapt_uccsd_hybrid",
+    "energy": -2.4113939060935543,
+    "exact": -2.9951817618817382,
+    "delta_e": 0.5837878557881839
+  },
+  {
+    "sites": 5,
+    "ansatz": "vqe_cse_ops",
+    "energy": -2.742564035920383,
+    "exact": -2.9951817618817382,
+    "delta_e": 0.25261772596135534
+  },
+  {
+    "sites": 6,
+    "ansatz": "adapt_cse_hybrid",
+    "energy": -2.7173013783198376,
+    "exact": -3.2327813890621293,
+    "delta_e": 0.5154800107422917
+  },
+  {
+    "sites": 6,
+    "ansatz": "uccsd",
+    "energy": -2.6518622632132796,
+    "exact": -3.2327813890621293,
+    "delta_e": 0.5809191258488497
+  },
+  {
+    "sites": 6,
+    "ansatz": "vqe_cse_ops",
+    "energy": -2.7425640290536197,
+    "exact": -3.2327813890621293,
+    "delta_e": 0.4902173600085096
+  },
+  {
+    "sites": 6,
+    "ansatz": "adapt_uccsd_hybrid",
+    "energy": -2.4113939060933642,
+    "exact": -3.2327813890621293,
+    "delta_e": 0.8213874829687651
   }
 ]

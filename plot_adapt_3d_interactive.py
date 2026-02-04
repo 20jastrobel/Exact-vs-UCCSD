@@ -25,12 +25,37 @@ def log_base(x, base: float):
     return np.log(x) / np.log(base)
 
 
+def discover_latest_runs_by_site(runs_root: Path) -> list[Path]:
+    """Discover the latest run directory per site L under runs_root."""
+    latest: dict[int, tuple[float, Path]] = {}
+    if not runs_root.exists():
+        return []
+    for run_dir in runs_root.iterdir():
+        if not run_dir.is_dir():
+            continue
+        meta_path = run_dir / "meta.json"
+        hist_path = run_dir / "history.jsonl"
+        if not meta_path.exists() or not hist_path.exists():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text())
+            sites = int(meta.get("sites"))
+        except Exception:
+            continue
+        mtime = meta_path.stat().st_mtime
+        prev = latest.get(sites)
+        if prev is None or mtime > prev[0]:
+            latest[sites] = (mtime, run_dir)
+    return [path for _sites, (_mtime, path) in sorted(latest.items(), key=lambda kv: kv[0])]
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--runs", nargs="+", required=True)
+    ap.add_argument("--runs", nargs="*")
+    ap.add_argument("--runs-root", type=str, default="runs")
     ap.add_argument("--log-base", type=float, default=10.0)
     ap.add_argument("--eps", type=float, default=1e-16)
-    ap.add_argument("--save", type=str, default="runs/adapt3d_interactive.html")
+    ap.add_argument("--save", type=str, default="runs/adapt3d_L2_to_L6_interactive.html")
     args = ap.parse_args()
 
     try:
@@ -40,7 +65,16 @@ def main():
 
     fig = go.Figure()
 
-    for run in args.runs:
+    run_list = list(args.runs or [])
+    if not run_list:
+        discovered = discover_latest_runs_by_site(Path(args.runs_root))
+        run_list = [str(p) for p in discovered]
+        if run_list:
+            print(f"Discovered runs: {', '.join(run_list)}")
+    if not run_list:
+        raise ValueError("No runs provided and none discovered under runs root.")
+
+    for run in run_list:
         run_dir = Path(run)
         meta, hist = load_run(run_dir)
         e_exact = meta.get("exact_energy", None)

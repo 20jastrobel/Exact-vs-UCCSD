@@ -183,12 +183,15 @@ def main() -> None:
         "--pool",
         type=str,
         default="ham_terms_plus_imag_partners",
-        choices=["ham_terms", "ham_terms_plus_imag_partners", "cse_density_ops"],
+        choices=["ham_terms", "ham_terms_plus_imag_partners", "cse_density_ops", "uccsd_excitations"],
     )
     parser.add_argument("--weights", type=str, default=None)
     parser.add_argument("--save", type=str, default=None)
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
+
+    if args.pool == "uccsd":
+        args.pool = "uccsd_excitations"
 
     ferm_op = build_fermionic_hubbard(
         n_sites=args.sites,
@@ -332,7 +335,7 @@ def main() -> None:
         first = result.diagnostics["outer"][0]
         print(f"max|g| at n=0:      {first['max_grad']:.6e}")
         print(f"chosen operator:    {first['chosen_op']}")
-        if args.pool == "cse_density_ops":
+        if args.pool in {"cse_density_ops", "uccsd_excitations"}:
             pool_size = result.diagnostics.get("pool_size", [None])[0]
             print(f"pool size:          {pool_size}")
             comps = first.get("chosen_components") or []
@@ -367,7 +370,7 @@ def main() -> None:
         n_q, sz_q = map_symmetry_ops_to_qubits(_mapper, args.sites)
         from qiskit.quantum_info import Statevector
         from pydephasing.quantum.vqe.adapt_vqe_meta import build_adapt_circuit, build_adapt_circuit_grouped
-        if args.pool == "cse_density_ops":
+        if args.pool in {"cse_density_ops", "uccsd_excitations"}:
             circuit, params = build_adapt_circuit_grouped(reference_state, result.operators)
         else:
             circuit, params = build_adapt_circuit(reference_state, result.operators)

@@ -8,16 +8,37 @@ from qiskit.quantum_info import SparsePauliOp
 from qiskit_algorithms import VQE
 from qiskit_algorithms.optimizers import COBYLA
 
-from pydephasing.quantum.ansatz import build_clustered_ansatz
+from pydephasing.quantum.ansatz import build_ansatz
 from pydephasing.quantum.hamiltonian.exact import exact_ground_energy
-from pydephasing.quantum.hamiltonian.hubbard import build_qubit_hamiltonian
+from pydephasing.quantum.hamiltonian.hubbard import (
+    build_fermionic_hubbard,
+    build_qubit_hamiltonian_from_fermionic,
+    default_1d_chain_edges,
+)
 
-def run_vqe(qubit_op: SparsePauliOp, maxiter: int, reps: int, seed: int) -> tuple[float, float]:
+
+def run_vqe(
+    qubit_op: SparsePauliOp,
+    mapper,
+    *,
+    n_sites: int,
+    n_up: int,
+    n_down: int,
+    maxiter: int,
+    reps: int,
+    seed: int,
+) -> tuple[float, float]:
     estimator = StatevectorEstimator()
-    ansatz = build_clustered_ansatz(num_qubits=qubit_op.num_qubits, reps=reps)
+    ansatz = build_ansatz(
+        "uccsd",
+        qubit_op.num_qubits,
+        reps,
+        mapper,
+        n_sites=n_sites,
+        num_particles=(n_up, n_down),
+    )
     optimizer = COBYLA(maxiter=maxiter)
-    rng = np.random.default_rng(seed)
-    initial_point = rng.random(ansatz.num_parameters) * 2 * np.pi
+    initial_point = np.zeros(ansatz.num_parameters, dtype=float)
 
     vqe = VQE(
         estimator=estimator,
@@ -35,7 +56,7 @@ def run_vqe(qubit_op: SparsePauliOp, maxiter: int, reps: int, seed: int) -> tupl
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Local VQE vs exact ground-state energy for 2-site Hubbard (4 qubits)."
+        description="Local UCCSD-VQE vs exact ground-state energy for 2-site Hubbard (4 qubits)."
     )
     parser.add_argument("--t", type=float, default=1.0)
     parser.add_argument("--u", type=float, default=4.0)
@@ -43,11 +64,29 @@ def main() -> None:
     parser.add_argument("--maxiter", type=int, default=150)
     parser.add_argument("--reps", type=int, default=3)
     parser.add_argument("--seed", type=int, default=11)
+    parser.add_argument("--n-up", type=int, default=1)
+    parser.add_argument("--n-down", type=int, default=1)
     args = parser.parse_args()
 
-    qubit_op, _mapper = build_qubit_hamiltonian(args.t, args.u, args.dv)
+    ferm_op = build_fermionic_hubbard(
+        n_sites=2,
+        t=args.t,
+        u=args.u,
+        edges=default_1d_chain_edges(2, periodic=False),
+        v=[-args.dv / 2, args.dv / 2],
+    )
+    qubit_op, mapper = build_qubit_hamiltonian_from_fermionic(ferm_op)
     exact = exact_ground_energy(qubit_op)
-    vqe_energy, elapsed = run_vqe(qubit_op, args.maxiter, args.reps, args.seed)
+    vqe_energy, elapsed = run_vqe(
+        qubit_op,
+        mapper,
+        n_sites=2,
+        n_up=args.n_up,
+        n_down=args.n_down,
+        maxiter=args.maxiter,
+        reps=args.reps,
+        seed=args.seed,
+    )
 
     diff = vqe_energy - exact
 

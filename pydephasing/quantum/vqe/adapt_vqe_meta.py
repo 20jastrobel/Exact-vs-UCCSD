@@ -19,6 +19,8 @@ from .meta_lstm_optimizer import CoordinateWiseLSTMOptimizer, LSTMState
 from .meta_lstm import preprocess_gradients_torch
 from ..symmetry import commutes, map_symmetry_ops_to_qubits
 
+GROUPED_POOL_MODES = {"cse_density_ops", "uccsd_excitations"}
+
 
 @dataclass
 class MetaAdaptVQEResult:
@@ -141,6 +143,87 @@ def build_cse_density_pool_from_fermionic(
                 "paulis": paulis,
             }
         )
+
+    return pool
+
+
+def build_uccsd_excitation_pool(
+    *,
+    n_sites: int,
+    num_particles: tuple[int, int],
+    mapper: JordanWignerMapper,
+    reps: int = 1,
+    include_imaginary: bool = False,
+    preserve_spin: bool = True,
+    generalized: bool = False,
+    dedup_tol: float = 1e-12,
+) -> list[dict]:
+    """Return grouped Pauli operators from UCCSD excitation generators."""
+    if mapper is None:
+        raise ValueError("mapper must be provided for UCCSD excitation pool.")
+
+    try:
+        from qiskit_nature.second_q.circuit.library import HartreeFock, UCCSD
+    except ImportError:  # pragma: no cover
+        from qiskit_nature.circuit.library import HartreeFock, UCCSD
+
+    try:
+        initial_state = HartreeFock(
+            num_spatial_orbitals=int(n_sites),
+            num_particles=(int(num_particles[0]), int(num_particles[1])),
+            qubit_mapper=mapper,
+        )
+    except TypeError:
+        initial_state = HartreeFock(int(n_sites), (int(num_particles[0]), int(num_particles[1])), mapper)
+
+    try:
+        ansatz = UCCSD(
+            num_spatial_orbitals=int(n_sites),
+            num_particles=(int(num_particles[0]), int(num_particles[1])),
+            qubit_mapper=mapper,
+            reps=int(reps),
+            initial_state=initial_state,
+            generalized=generalized,
+            preserve_spin=preserve_spin,
+            include_imaginary=include_imaginary,
+        )
+    except TypeError:
+        ansatz = UCCSD(
+            int(n_sites),
+            (int(num_particles[0]), int(num_particles[1])),
+            mapper,
+            reps=int(reps),
+            initial_state=initial_state,
+        )
+
+    operators = list(getattr(ansatz, "operators", []))
+    excitation_list = list(getattr(ansatz, "excitation_list", []))
+
+    pool: list[dict] = []
+    seen: set[tuple] = set()
+    for idx, op in enumerate(operators):
+        labels = op.paulis.to_labels()
+        coeffs = op.coeffs
+        paulis: list[tuple[str, float]] = []
+        for lbl, coeff in zip(labels, coeffs):
+            if lbl == "I" * op.num_qubits:
+                continue
+            if abs(coeff.imag) > dedup_tol:
+                continue
+            weight = float(np.real(coeff))
+            if abs(weight) <= dedup_tol:
+                continue
+            paulis.append((lbl, weight))
+        if not paulis:
+            continue
+        paulis.sort(key=lambda item: item[0])
+        key = tuple((lbl, round(w, 12)) for lbl, w in paulis)
+        if key in seen:
+            continue
+        seen.add(key)
+        exc = excitation_list[idx] if idx < len(excitation_list) else None
+        name = f"uccsd_exc({exc})" if exc is not None else f"uccsd_exc_{idx}"
+        pool.append({"name": name, "paulis": paulis})
 
     return pool
 
@@ -544,19 +627,30 @@ def run_meta_adapt_vqe(
             raise ValueError("mapper and n_sites are required when enforce_sector is True.")
         n_q, sz_q = map_symmetry_ops_to_qubits(mapper, n_sites)
 
-    if pool_mode == "cse_density_ops":
+    if pool_mode in GROUPED_POOL_MODES:
         if pool is not None:
             pool_specs = list(pool)  # assume list of dict specs
         else:
-            if ferm_op is None or mapper is None:
-                raise ValueError("ferm_op and mapper are required for cse_density_ops pool.")
-            pool_specs = build_cse_density_pool_from_fermionic(
-                ferm_op,
-                mapper,
-                include_diagonal=cse_include_diagonal,
-                enforce_symmetry=enforce_sector,
-                n_sites=n_sites,
-            )
+            if pool_mode == "cse_density_ops":
+                if ferm_op is None or mapper is None:
+                    raise ValueError("ferm_op and mapper are required for cse_density_ops pool.")
+                pool_specs = build_cse_density_pool_from_fermionic(
+                    ferm_op,
+                    mapper,
+                    include_diagonal=cse_include_diagonal,
+                    enforce_symmetry=enforce_sector,
+                    n_sites=n_sites,
+                )
+            elif pool_mode == "uccsd_excitations":
+                if mapper is None or n_sites is None or n_up is None or n_down is None:
+                    raise ValueError("mapper, n_sites, n_up, n_down are required for uccsd_excitations pool.")
+                pool_specs = build_uccsd_excitation_pool(
+                    n_sites=n_sites,
+                    num_particles=(int(n_up), int(n_down)),
+                    mapper=mapper,
+                )
+            else:
+                raise ValueError(f"Unknown pool mode: {pool_mode}")
         if not pool_specs:
             raise ValueError("Operator pool is empty.")
         if enforce_sector and n_q is not None and sz_q is not None:
@@ -596,7 +690,7 @@ def run_meta_adapt_vqe(
     lstm_state = lstm_optimizer.init_state(0)
 
     diagnostics: dict[str, list] = {"outer": []}
-    if pool_mode == "cse_density_ops":
+    if pool_mode in GROUPED_POOL_MODES:
         diagnostics["pool_size"] = [len(pool_specs)]
     else:
         diagnostics["pool_size"] = [len(pool_labels)]
@@ -621,7 +715,15 @@ def run_meta_adapt_vqe(
     for outer_idx in range(max_depth):
         if logger is not None:
             logger.start_iter()
-        if pool_mode == "cse_density_ops":
+        if pool_mode in GROUPED_POOL_MODES and not pool_specs:
+            if verbose:
+                print("ADAPT stop: operator pool exhausted.")
+            break
+        if pool_mode not in GROUPED_POOL_MODES and not pool_labels:
+            if verbose:
+                print("ADAPT stop: operator pool exhausted.")
+            break
+        if pool_mode in GROUPED_POOL_MODES:
             circuit, _params = build_adapt_circuit_grouped(reference_state, ops)
         else:
             circuit, _params = build_adapt_circuit(reference_state, ops)
@@ -629,7 +731,7 @@ def run_meta_adapt_vqe(
         def energy_fn(values: Iterable[float]) -> float:
             return estimate_energy(estimator, circuit, qubit_op, list(values))
 
-        if pool_mode == "cse_density_ops":
+        if pool_mode in GROUPED_POOL_MODES:
             pool_gradients = _compute_grouped_pool_gradients(
                 estimator,
                 circuit,
@@ -698,7 +800,7 @@ def run_meta_adapt_vqe(
                     )
             break
 
-        if pool_mode == "cse_density_ops":
+        if pool_mode in GROUPED_POOL_MODES:
             chosen_spec = pool_specs[max_idx]
             ops.append(chosen_spec)
             chosen_op = chosen_spec["name"]
@@ -713,7 +815,7 @@ def run_meta_adapt_vqe(
             print(
                 f"ADAPT iter {len(ops)}: op={chosen_op}, max|g|={max_abs_grad:.6e}"
             )
-            if pool_mode == "cse_density_ops":
+            if pool_mode in GROUPED_POOL_MODES:
                 comp_preview = ", ".join(
                     f"{lbl}:{wt:.3f}" for lbl, wt in chosen_spec["paulis"][:6]
                 )
@@ -731,7 +833,7 @@ def run_meta_adapt_vqe(
         else:
             lstm_state = lstm_optimizer.init_state(len(theta))
 
-        if pool_mode == "cse_density_ops":
+        if pool_mode in GROUPED_POOL_MODES:
             circuit, _params = build_adapt_circuit_grouped(reference_state, ops)
         else:
             circuit, _params = build_adapt_circuit(reference_state, ops)
@@ -877,7 +979,7 @@ def run_meta_adapt_vqe(
             {
                 "outer_iter": len(ops),
                 "chosen_op": chosen_op,
-                "chosen_components": chosen_spec["paulis"] if pool_mode == "cse_density_ops" else None,
+                "chosen_components": chosen_spec["paulis"] if pool_mode in GROUPED_POOL_MODES else None,
                 "max_grad": max_abs_grad,
                 "energy": energy_current,
                 "pool_gradients": pool_gradients,

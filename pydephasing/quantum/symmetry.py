@@ -6,6 +6,7 @@ import numpy as np
 from qiskit.quantum_info import SparsePauliOp
 from qiskit_nature.second_q.mappers import JordanWignerMapper
 from qiskit_nature.second_q.operators import FermionicOp
+from scipy.sparse.linalg import eigsh
 
 
 def fermionic_number_op(n_sites: int) -> FermionicOp:
@@ -63,10 +64,18 @@ def exact_ground_energy_sector(
     if not indices:
         raise ValueError("No basis states in target sector.")
 
-    mat = qubit_op.to_matrix()
-    sub = mat[np.ix_(indices, indices)]
-    evals = np.linalg.eigvalsh(sub)
-    return float(np.min(np.real(evals)))
+    # Prefer sparse matrices to avoid repeated format conversions and warnings.
+    mat_sparse = qubit_op.to_matrix(sparse=True).tocsc()
+    sub_sparse = mat_sparse[indices, :][:, indices].tocsc()
+    dim = sub_sparse.shape[0]
+
+    if dim <= 256:
+        sub = sub_sparse.toarray()
+        evals = np.linalg.eigvalsh(sub)
+        return float(np.min(np.real(evals)))
+
+    val = eigsh(sub_sparse, k=1, which="SA", return_eigenvectors=False)[0]
+    return float(np.real(val))
 
 
 def commutes(op: SparsePauliOp, sym: SparsePauliOp, tol: float = 1e-12) -> bool:
