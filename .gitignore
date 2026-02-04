@@ -34,3 +34,4 @@ pydeph
 petsc
 # Local notebooks and secrets
 Untitled-1.ipynb
+.DS_Store
