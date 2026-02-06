@@ -46,3 +46,34 @@ def test_cse_density_pool_gradient_nonzero() -> None:
         probe_convention="half_angle",
     )
     assert np.max(np.abs(grads)) > 0.0
+
+
+def test_cse_density_pool_includes_both_quadratures() -> None:
+    ferm_op = build_fermionic_hubbard(
+        n_sites=2,
+        t=1.0,
+        u=4.0,
+        edges=default_1d_chain_edges(2, periodic=False),
+        v=[-0.25, 0.25],
+    )
+    mapper = JordanWignerMapper()
+
+    pool_im_only = build_cse_density_pool_from_fermionic(
+        ferm_op,
+        mapper,
+        include_antihermitian_part=True,
+        include_hermitian_part=False,
+    )
+    pool_both = build_cse_density_pool_from_fermionic(
+        ferm_op,
+        mapper,
+        include_antihermitian_part=True,
+        include_hermitian_part=True,
+    )
+
+    assert len(pool_im_only) > 0
+    assert len(pool_both) >= len(pool_im_only)
+
+    names = [spec.get("name", "") for spec in pool_both]
+    assert any(name.startswith("gamma_im(") for name in names)
+    assert any(name.startswith("gamma_re(") for name in names)

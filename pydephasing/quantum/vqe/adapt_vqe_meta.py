@@ -30,6 +30,71 @@ class MetaAdaptVQEResult:
     diagnostics: dict
 
 
+def _canonicalize_to_hermitian(op: SparsePauliOp, *, atol: float) -> SparsePauliOp:
+    """Return a numerically Hermitian SparsePauliOp from a possibly non-Hermitian input.
+
+    If the operator is closer to anti-Hermitian than Hermitian, rotate by -i so
+    the returned operator is Hermitian. This is used to avoid silently dropping
+    Pauli terms with nontrivial imaginary components when building grouped pools.
+    """
+    op = op.simplify(atol=atol)
+    herm = 0.5 * (op + op.adjoint())
+    anti = 0.5 * (op - op.adjoint())
+    herm_norm = float(np.sum(np.abs(herm.coeffs))) if len(herm.coeffs) else 0.0
+    anti_norm = float(np.sum(np.abs(anti.coeffs))) if len(anti.coeffs) else 0.0
+    if anti_norm > herm_norm:
+        op = (-1j) * anti
+    else:
+        op = herm
+    return op.simplify(atol=atol)
+
+
+def _grouped_spec_from_sparse_pauli_op(
+    op: SparsePauliOp,
+    *,
+    name: str,
+    dedup_tol: float,
+    seen: set[tuple] | None = None,
+) -> dict | None:
+    """Convert an operator to the grouped {name, paulis} spec used by grouped ADAPT pools.
+
+    The conversion:
+    - removes identity components,
+    - coerces numerically-real coefficients to real weights,
+    - rejects truly complex coefficients after Hermitian canonicalization,
+    - drops near-zero weights and deduplicates based on a rounded signature.
+    """
+    if op is None:
+        return None
+
+    op = _canonicalize_to_hermitian(op, atol=dedup_tol)
+    identity = "I" * op.num_qubits
+
+    paulis: list[tuple[str, float]] = []
+    for lbl, coeff in zip(op.paulis.to_labels(), op.coeffs):
+        if lbl == identity:
+            continue
+        if abs(coeff.imag) > dedup_tol:
+            raise ValueError(
+                f"Non-real Pauli coefficient after Hermitian canonicalization in {name}: {coeff}."
+            )
+        weight = float(coeff.real)
+        if abs(weight) <= dedup_tol:
+            continue
+        paulis.append((lbl, weight))
+
+    if not paulis:
+        return None
+
+    paulis.sort(key=lambda item: item[0])
+    key = tuple((lbl, round(w, 12)) for lbl, w in paulis)
+    if seen is not None:
+        if key in seen:
+            return None
+        seen.add(key)
+    return {"name": name, "paulis": paulis}
+
+
 def build_operator_pool_from_hamiltonian(
     qubit_op: SparsePauliOp,
     *,
@@ -75,6 +140,8 @@ def build_cse_density_pool_from_fermionic(
     mapper: JordanWignerMapper,
     *,
     include_diagonal: bool = False,
+    include_antihermitian_part: bool = True,
+    include_hermitian_part: bool = True,
     dedup_tol: float = 1e-12,
     enforce_symmetry: bool = False,
     n_sites: int | None = None,
@@ -106,43 +173,36 @@ def build_cse_density_pool_from_fermionic(
         else:
             continue
 
-        k_op = gamma - gamma.adjoint()
-        if len(getattr(k_op, "_data", {})) == 0:
-            continue
+        if include_antihermitian_part:
+            # Imag/current-like quadrature: A = i (gamma - gamma^\dagger) (Hermitian).
+            k_op = gamma - gamma.adjoint()
+            if len(getattr(k_op, "_data", {})) != 0:
+                qubit_k = mapper.map(k_op)
+                if qubit_k is not None:
+                    op_im = (-1j) * qubit_k
+                    spec = _grouped_spec_from_sparse_pauli_op(
+                        op_im,
+                        name=f"gamma_im({label})",
+                        dedup_tol=dedup_tol,
+                        seen=seen,
+                    )
+                    if spec is not None:
+                        pool.append(spec)
 
-        qubit_k = mapper.map(k_op)
-        if qubit_k is None:
-            continue
-        qubit_k = qubit_k.simplify(atol=dedup_tol)
-        a_op = (-1j) * qubit_k
-
-        labels = a_op.paulis.to_labels()
-        coeffs = a_op.coeffs
-        paulis: list[tuple[str, float]] = []
-        for lbl, coeff in zip(labels, coeffs):
-            if lbl == "I" * a_op.num_qubits:
-                continue
-            if abs(coeff.imag) > dedup_tol:
-                continue
-            weight = float(coeff.real)
-            if abs(weight) <= dedup_tol:
-                continue
-            paulis.append((lbl, weight))
-
-        if not paulis:
-            continue
-
-        paulis.sort(key=lambda item: item[0])
-        key = tuple((lbl, round(w, 12)) for lbl, w in paulis)
-        if key in seen:
-            continue
-        seen.add(key)
-        pool.append(
-            {
-                "name": f"gamma({label})",
-                "paulis": paulis,
-            }
-        )
+        if include_hermitian_part:
+            # Real/hopping-like quadrature: B = gamma + gamma^\dagger (Hermitian).
+            h_op = gamma + gamma.adjoint()
+            if len(getattr(h_op, "_data", {})) != 0:
+                qubit_h = mapper.map(h_op)
+                if qubit_h is not None:
+                    spec = _grouped_spec_from_sparse_pauli_op(
+                        qubit_h,
+                        name=f"gamma_re({label})",
+                        dedup_tol=dedup_tol,
+                        seen=seen,
+                    )
+                    if spec is not None:
+                        pool.append(spec)
 
     return pool
 
@@ -202,28 +262,16 @@ def build_uccsd_excitation_pool(
     pool: list[dict] = []
     seen: set[tuple] = set()
     for idx, op in enumerate(operators):
-        labels = op.paulis.to_labels()
-        coeffs = op.coeffs
-        paulis: list[tuple[str, float]] = []
-        for lbl, coeff in zip(labels, coeffs):
-            if lbl == "I" * op.num_qubits:
-                continue
-            if abs(coeff.imag) > dedup_tol:
-                continue
-            weight = float(np.real(coeff))
-            if abs(weight) <= dedup_tol:
-                continue
-            paulis.append((lbl, weight))
-        if not paulis:
-            continue
-        paulis.sort(key=lambda item: item[0])
-        key = tuple((lbl, round(w, 12)) for lbl, w in paulis)
-        if key in seen:
-            continue
-        seen.add(key)
         exc = excitation_list[idx] if idx < len(excitation_list) else None
         name = f"uccsd_exc({exc})" if exc is not None else f"uccsd_exc_{idx}"
-        pool.append({"name": name, "paulis": paulis})
+        spec = _grouped_spec_from_sparse_pauli_op(
+            op,
+            name=name,
+            dedup_tol=dedup_tol,
+            seen=seen,
+        )
+        if spec is not None:
+            pool.append(spec)
 
     return pool
 
@@ -300,6 +348,54 @@ def estimate_energy(
     result = job.result()
     ev = result[0].data.evs
     return float(np.real(ev))
+
+
+def estimate_expectation(
+    estimator: BaseEstimatorV2,
+    circuit: QuantumCircuit,
+    op: SparsePauliOp,
+    params: Sequence[float],
+) -> float:
+    job = estimator.run([(circuit, op, list(params))])
+    result = job.result()
+    ev = result[0].data.evs
+    return float(np.real(ev))
+
+
+def compute_sector_diagnostics(
+    *,
+    estimator: BaseEstimatorV2,
+    circuit: QuantumCircuit,
+    params: Sequence[float],
+    mapper: JordanWignerMapper,
+    n_sites: int,
+    n_target: int,
+    sz_target: float,
+    simplify_atol: float = 1e-12,
+) -> dict:
+    """Compute N/Sz moments and simple sector leakage diagnostics for a circuit state."""
+    n_q, sz_q = map_symmetry_ops_to_qubits(mapper, int(n_sites))
+
+    n_mean = estimate_expectation(estimator, circuit, n_q, params)
+    sz_mean = estimate_expectation(estimator, circuit, sz_q, params)
+
+    n2_q = (n_q @ n_q).simplify(atol=simplify_atol)
+    sz2_q = (sz_q @ sz_q).simplify(atol=simplify_atol)
+
+    n2_mean = estimate_expectation(estimator, circuit, n2_q, params)
+    sz2_mean = estimate_expectation(estimator, circuit, sz2_q, params)
+
+    var_n = float(max(0.0, n2_mean - n_mean * n_mean))
+    var_sz = float(max(0.0, sz2_mean - sz_mean * sz_mean))
+
+    return {
+        "N_mean": float(n_mean),
+        "Sz_mean": float(sz_mean),
+        "VarN": var_n,
+        "VarSz": var_sz,
+        "abs_N_err": float(abs(n_mean - float(n_target))),
+        "abs_Sz_err": float(abs(sz_mean - float(sz_target))),
+    }
 
 
 def parameter_shift_grad(
@@ -585,7 +681,13 @@ def run_meta_adapt_vqe(
     pool_mode: str = "ham_terms_plus_imag_partners",
     ferm_op: FermionicOp | None = None,
     mapper: JordanWignerMapper | None = None,
-    cse_include_diagonal: bool = False,
+    cse_include_diagonal: bool = True,
+    cse_include_antihermitian_part: bool = True,
+    cse_include_hermitian_part: bool = True,
+    uccsd_reps: int = 1,
+    uccsd_include_imaginary: bool = False,
+    uccsd_generalized: bool = False,
+    uccsd_preserve_spin: bool = True,
     n_sites: int | None = None,
     n_up: int | None = None,
     n_down: int | None = None,
@@ -638,6 +740,8 @@ def run_meta_adapt_vqe(
                     ferm_op,
                     mapper,
                     include_diagonal=cse_include_diagonal,
+                    include_antihermitian_part=cse_include_antihermitian_part,
+                    include_hermitian_part=cse_include_hermitian_part,
                     enforce_symmetry=enforce_sector,
                     n_sites=n_sites,
                 )
@@ -648,6 +752,10 @@ def run_meta_adapt_vqe(
                     n_sites=n_sites,
                     num_particles=(int(n_up), int(n_down)),
                     mapper=mapper,
+                    reps=uccsd_reps,
+                    include_imaginary=uccsd_include_imaginary,
+                    preserve_spin=uccsd_preserve_spin,
+                    generalized=uccsd_generalized,
                 )
             else:
                 raise ValueError(f"Unknown pool mode: {pool_mode}")
@@ -698,6 +806,17 @@ def run_meta_adapt_vqe(
     shift, coeff = _probe_shift_and_coeff(probe_convention)
 
     if logger is not None:
+        sector_extra = None
+        if mapper is not None and n_sites is not None and n_up is not None and n_down is not None:
+            sector_extra = compute_sector_diagnostics(
+                estimator=estimator,
+                circuit=reference_state,
+                params=[],
+                mapper=mapper,
+                n_sites=int(n_sites),
+                n_target=int(n_up) + int(n_down),
+                sz_target=0.5 * (int(n_up) - int(n_down)),
+            )
         logger.log_point(
             it=0,
             energy=energy_current,
@@ -709,6 +828,7 @@ def run_meta_adapt_vqe(
                 "ansatz_len": 0,
                 "n_params": 0,
                 "pool_size": len(pool_specs) if pool_specs is not None else len(pool_labels),
+                **(sector_extra or {}),
             },
         )
 
@@ -959,6 +1079,18 @@ def run_meta_adapt_vqe(
         prev_energy = energy_current
         energy_current = energy_fn(theta)
 
+        sector_diag = None
+        if mapper is not None and n_sites is not None and n_up is not None and n_down is not None:
+            sector_diag = compute_sector_diagnostics(
+                estimator=estimator,
+                circuit=circuit,
+                params=theta,
+                mapper=mapper,
+                n_sites=int(n_sites),
+                n_target=int(n_up) + int(n_down),
+                sz_target=0.5 * (int(n_up) - int(n_down)),
+            )
+
         if logger is not None:
             dt, tc = logger.end_iter()
             if (outer_idx + 1) % max(1, log_every) == 0:
@@ -973,6 +1105,7 @@ def run_meta_adapt_vqe(
                         "ansatz_len": len(ops),
                         "n_params": len(theta),
                         "pool_size": len(pool_specs) if pool_specs is not None else len(pool_labels),
+                        **(sector_diag or {}),
                     },
                 )
         diagnostics["outer"].append(
@@ -985,6 +1118,7 @@ def run_meta_adapt_vqe(
                 "pool_gradients": pool_gradients,
                 "inner_stats": inner_stats,
                 "inner_optimizer": inner_optimizer,
+                "sector": sector_diag,
             }
         )
 

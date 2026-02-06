@@ -17,6 +17,10 @@ from pydephasing.quantum.hamiltonian.hubbard import (
     default_1d_chain_edges,
 )
 from pydephasing.quantum.symmetry import exact_ground_energy_sector
+from pydephasing.quantum.utils_particles import (
+    half_filling_num_particles,
+    jw_reference_occupations_from_particles,
+)
 from pydephasing.quantum.vqe.adapt_vqe_meta import build_reference_state, run_meta_adapt_vqe
 
 
@@ -29,7 +33,10 @@ def run_case(*, n_sites: int, t: float, u: float, dv: float, n_up: int, n_down: 
         v=[-dv / 2, dv / 2] if n_sites == 2 else None,
     )
     qubit_op, mapper = build_qubit_hamiltonian_from_fermionic(ferm_op)
-    reference = build_reference_state(qubit_op.num_qubits, [0, n_sites])
+    reference = build_reference_state(
+        qubit_op.num_qubits,
+        jw_reference_occupations_from_particles(n_sites, n_up, n_down),
+    )
     estimator = StatevectorEstimator()
 
     exact = exact_ground_energy_sector(qubit_op, n_sites, n_up + n_down, 0.5 * (n_up - n_down))
@@ -356,8 +363,14 @@ def _plot_interactive(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--sites", nargs="+", type=int, default=[2, 3, 4, 5, 6])
-    ap.add_argument("--n-up", type=int, default=1)
-    ap.add_argument("--n-down", type=int, default=1)
+    ap.add_argument("--n-up", type=int, default=None)
+    ap.add_argument("--n-down", type=int, default=None)
+    ap.add_argument(
+        "--odd-sz-target",
+        type=float,
+        default=0.5,
+        help="Half-filling Sz target for odd L (default +0.5). Ignored if --n-up/--n-down are set.",
+    )
     ap.add_argument("--dv", type=float, default=0.5)
     ap.add_argument("--t-fixed", type=float, default=1.0)
     ap.add_argument("--u-fixed", type=float, default=4.0)
@@ -369,6 +382,10 @@ def main() -> None:
     ap.add_argument("--out-dir", type=str, default="runs/sweeps")
     ap.add_argument("--sweep-json", type=str, default="sweep_t_u_multi.json")
     args = ap.parse_args()
+
+    if (args.n_up is None) != (args.n_down is None):
+        raise ValueError("Both --n-up and --n-down must be set together.")
+    sector_mode = "fixed" if args.n_up is not None else "half_filling"
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -385,6 +402,14 @@ def main() -> None:
         else set()
     )
     sites = sorted(requested_sites | existing_sites)
+    sectors = {}
+    for n_sites in sites:
+        if sector_mode == "fixed":
+            n_up, n_down = int(args.n_up), int(args.n_down)
+        else:
+            sz = 0.0 if int(n_sites) % 2 == 0 else float(args.odd_sz_target)
+            n_up, n_down = half_filling_num_particles(int(n_sites), sz_target=sz)
+        sectors[str(int(n_sites))] = [int(n_up), int(n_down)]
     payload.update(
         {
             "sites": sites,
@@ -393,8 +418,11 @@ def main() -> None:
             "u_fixed": float(args.u_fixed),
             "t_fixed": float(args.t_fixed),
             "dv": float(args.dv),
-            "n_up": int(args.n_up),
-            "n_down": int(args.n_down),
+            "sector_mode": sector_mode,
+            "odd_sz_target": float(args.odd_sz_target),
+            "n_up": None if args.n_up is None else int(args.n_up),
+            "n_down": None if args.n_down is None else int(args.n_down),
+            "sectors": sectors,
             "exact_vs_t": payload.get("exact_vs_t", {}) if isinstance(payload.get("exact_vs_t", {}), dict) else {},
             "adapt_vs_t": payload.get("adapt_vs_t", {}) if isinstance(payload.get("adapt_vs_t", {}), dict) else {},
             "exact_vs_u": payload.get("exact_vs_u", {}) if isinstance(payload.get("exact_vs_u", {}), dict) else {},
@@ -407,6 +435,11 @@ def main() -> None:
     _write_payload(sweep_path, payload)
 
     for n_sites in sorted(requested_sites):
+        if sector_mode == "fixed":
+            n_up, n_down = int(args.n_up), int(args.n_down)
+        else:
+            sz = 0.0 if int(n_sites) % 2 == 0 else float(args.odd_sz_target)
+            n_up, n_down = half_filling_num_particles(int(n_sites), sz_target=sz)
         _compute_missing(
             payload=payload,
             sweep_path=sweep_path,
@@ -416,8 +449,8 @@ def main() -> None:
             t_fixed=float(args.t_fixed),
             u_fixed=float(args.u_fixed),
             dv=float(args.dv),
-            n_up=int(args.n_up),
-            n_down=int(args.n_down),
+            n_up=int(n_up),
+            n_down=int(n_down),
         )
 
     t_out, u_out = _plot_interactive(

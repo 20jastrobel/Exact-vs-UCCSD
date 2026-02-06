@@ -31,6 +31,10 @@ from pydephasing.quantum.symmetry import (
     exact_ground_energy_sector,
     map_symmetry_ops_to_qubits,
 )
+from pydephasing.quantum.utils_particles import (
+    half_filling_num_particles,
+    jw_reference_occupations_from_particles,
+)
 
 
 def _parse_occ_list(value: str | None) -> list[int]:
@@ -108,7 +112,19 @@ def make_run_dir_and_meta(args) -> Path:
         "sites": args.sites,
         "n_up": args.n_up,
         "n_down": args.n_down,
+        "sz_target": getattr(args, "sz_target", None),
         "pool": getattr(args, "pool", None),
+        "cse": {
+            "include_diagonal": getattr(args, "cse_include_diagonal", None),
+            "include_antihermitian_part": getattr(args, "cse_include_antihermitian", None),
+            "include_hermitian_part": getattr(args, "cse_include_hermitian", None),
+        },
+        "uccsd": {
+            "reps": getattr(args, "uccsd_reps", None),
+            "include_imaginary": getattr(args, "uccsd_include_imaginary", None),
+            "generalized": getattr(args, "uccsd_generalized", None),
+            "preserve_spin": getattr(args, "uccsd_preserve_spin", None),
+        },
         "inner_optimizer": getattr(args, "inner_optimizer", None),
         "max_depth": getattr(args, "max_depth", None),
         "eps_grad": getattr(args, "eps_grad", None),
@@ -142,6 +158,12 @@ def main() -> None:
     parser.add_argument("--u", type=float, default=4.0)
     parser.add_argument("--dv", type=float, default=0.5)
     parser.add_argument("--sites", type=int, default=2)
+    parser.add_argument(
+        "--sz-target",
+        type=float,
+        default=0.0,
+        help="Target Sz sector used only for default half-filling (when --n-up/--n-down not set).",
+    )
     parser.add_argument("--max-depth", type=int, default=12)
     parser.add_argument("--inner-steps", type=int, default=25)
     parser.add_argument("--eps-grad", type=float, default=1e-4)
@@ -185,6 +207,19 @@ def main() -> None:
         default="ham_terms_plus_imag_partners",
         choices=["ham_terms", "ham_terms_plus_imag_partners", "cse_density_ops", "uccsd_excitations"],
     )
+    parser.add_argument("--cse-include-diagonal", dest="cse_include_diagonal", action="store_true", default=True)
+    parser.add_argument("--no-cse-include-diagonal", dest="cse_include_diagonal", action="store_false")
+    parser.add_argument("--cse-include-antihermitian", dest="cse_include_antihermitian", action="store_true", default=True)
+    parser.add_argument("--no-cse-include-antihermitian", dest="cse_include_antihermitian", action="store_false")
+    parser.add_argument("--cse-include-hermitian", dest="cse_include_hermitian", action="store_true", default=True)
+    parser.add_argument("--no-cse-include-hermitian", dest="cse_include_hermitian", action="store_false")
+    parser.add_argument("--uccsd-reps", type=int, default=1)
+    parser.add_argument("--uccsd-include-imaginary", dest="uccsd_include_imaginary", action="store_true", default=False)
+    parser.add_argument("--no-uccsd-include-imaginary", dest="uccsd_include_imaginary", action="store_false")
+    parser.add_argument("--uccsd-generalized", dest="uccsd_generalized", action="store_true", default=False)
+    parser.add_argument("--no-uccsd-generalized", dest="uccsd_generalized", action="store_false")
+    parser.add_argument("--uccsd-preserve-spin", dest="uccsd_preserve_spin", action="store_true", default=True)
+    parser.add_argument("--no-uccsd-preserve-spin", dest="uccsd_preserve_spin", action="store_false")
     parser.add_argument("--weights", type=str, default=None)
     parser.add_argument("--save", type=str, default=None)
     parser.add_argument("--quiet", action="store_true")
@@ -203,21 +238,29 @@ def main() -> None:
     qubit_op, _mapper = build_qubit_hamiltonian_from_fermionic(ferm_op)
     exact = exact_ground_energy(qubit_op)
 
-    if args.n_up is None or args.n_down is None:
-        if args.n_up is None and args.n_down is None:
-            args.n_up = args.sites // 2
-            args.n_down = args.sites // 2
-        else:
-            raise ValueError("Both --n-up and --n-down must be set together.")
-
     occupations = _parse_occ_list(args.occ)
-    if not occupations:
-        occupations = list(range(args.n_up)) + list(range(args.sites, args.sites + args.n_down))
-    else:
-        n_up = sum(1 for idx in occupations if idx < args.sites)
-        n_down = sum(1 for idx in occupations if idx >= args.sites)
-        if n_up != args.n_up or n_down != args.n_down:
+    if occupations:
+        n_up_occ = sum(1 for idx in occupations if idx < args.sites)
+        n_down_occ = sum(1 for idx in occupations if idx >= args.sites)
+        if args.n_up is None and args.n_down is None:
+            args.n_up = n_up_occ
+            args.n_down = n_down_occ
+        elif args.n_up is None or args.n_down is None:
+            raise ValueError("Both --n-up and --n-down must be set together.")
+        elif n_up_occ != args.n_up or n_down_occ != args.n_down:
             raise ValueError("Provided --occ does not match --n-up/--n-down sector.")
+    else:
+        if args.n_up is None and args.n_down is None:
+            try:
+                args.n_up, args.n_down = half_filling_num_particles(args.sites, sz_target=args.sz_target)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{exc} For odd L half-filling, pass --sz-target 0.5 or -0.5, "
+                    "or set --n-up/--n-down explicitly."
+                ) from exc
+        elif args.n_up is None or args.n_down is None:
+            raise ValueError("Both --n-up and --n-down must be set together.")
+        occupations = jw_reference_occupations_from_particles(args.sites, args.n_up, args.n_down)
 
     reference_state = build_reference_state(qubit_op.num_qubits, occupations)
 
@@ -296,6 +339,13 @@ def main() -> None:
         n_up=args.n_up,
         n_down=args.n_down,
         enforce_sector=args.enforce_sector,
+        cse_include_diagonal=args.cse_include_diagonal,
+        cse_include_antihermitian_part=args.cse_include_antihermitian,
+        cse_include_hermitian_part=args.cse_include_hermitian,
+        uccsd_reps=args.uccsd_reps,
+        uccsd_include_imaginary=args.uccsd_include_imaginary,
+        uccsd_generalized=args.uccsd_generalized,
+        uccsd_preserve_spin=args.uccsd_preserve_spin,
         r=args.meta_r,
         inner_optimizer=args.inner_optimizer,
         theta_bound=args.theta_bound,

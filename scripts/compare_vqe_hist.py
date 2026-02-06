@@ -23,6 +23,7 @@ from pydephasing.quantum.hamiltonian.hubbard import (
     default_1d_chain_edges,
 )
 from pydephasing.quantum.symmetry import exact_ground_energy_sector
+from pydephasing.quantum.utils_particles import half_filling_num_particles
 from pydephasing.quantum.vqe.adapt_vqe_meta import (
     build_adapt_circuit_grouped,
     build_cse_density_pool_from_fermionic,
@@ -494,8 +495,11 @@ def main() -> None:
 
     runs_root = Path("runs")
 
-    # Use the same sector for all sizes under symmetry enforcement.
-    sectors = {2: (1, 1), 3: (1, 1), 4: (1, 1), 5: (1, 1), 6: (1, 1)}
+    # Half-filling per size: N_total = L. For odd L, Sz=0 is impossible, so pick Sz=+0.5.
+    sectors = {
+        n: half_filling_num_particles(n, sz_target=0.0 if n % 2 == 0 else 0.5)
+        for n in (2, 3, 4, 5, 6)
+    }
 
     adapt_kinds = ["adapt_cse_hybrid", "adapt_uccsd_hybrid"]
     vqe_kinds = ["uccsd", "vqe_cse_ops"]
