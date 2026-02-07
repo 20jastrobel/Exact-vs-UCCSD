@@ -1,0 +1,17 @@
+{
+  "sites": [
+    2,
+    3
+  ],
+  "n_up": 1,
+  "n_down": 1,
+  "max_depth": 6,
+  "inner_steps": 25,
+  "warmup_steps": 5,
+  "polish_steps": 3,
+  "ham_params": {
+    "t": 1.0,
+    "u": 4.0,
+    "dv": 0.5
+  }
+}

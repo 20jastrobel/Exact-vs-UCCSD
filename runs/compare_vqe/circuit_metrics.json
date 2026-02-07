@@ -1,0 +1,622 @@
+{
+  "meta": {
+    "basis_gates": [
+      "rz",
+      "sx",
+      "x",
+      "cx"
+    ],
+    "ham_params": {
+      "dv": 0.5,
+      "t": 1.0,
+      "u": 4.0
+    },
+    "runtime_s": 0.8828601250424981,
+    "seed_transpiler": 7,
+    "sites": [
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "transpile_opt_level": 1
+  },
+  "rows": [
+    {
+      "ansatz": "adapt_cse_hybrid",
+      "n_down": 1,
+      "n_ops": 3,
+      "n_qubits": 4,
+      "n_up": 1,
+      "raw": {
+        "cx": 0,
+        "depth": 7,
+        "n_params": 3,
+        "ops": {
+          "PauliEvolution": 6,
+          "x": 2
+        },
+        "size": 8
+      },
+      "sites": 2,
+      "transpiled": {
+        "cx": 12,
+        "depth": 27,
+        "n_params": 3,
+        "ops": {
+          "cx": 12,
+          "rz": 30,
+          "sx": 16,
+          "x": 2
+        },
+        "size": 60
+      }
+    },
+    {
+      "ansatz": "vqe_cse_ops",
+      "n_down": 1,
+      "n_ops": 3,
+      "n_qubits": 4,
+      "n_up": 1,
+      "raw": {
+        "cx": 0,
+        "depth": 7,
+        "n_params": 3,
+        "ops": {
+          "PauliEvolution": 6,
+          "x": 2
+        },
+        "size": 8
+      },
+      "sites": 2,
+      "transpiled": {
+        "cx": 12,
+        "depth": 27,
+        "n_params": 3,
+        "ops": {
+          "cx": 12,
+          "rz": 30,
+          "sx": 16,
+          "x": 2
+        },
+        "size": 60
+      }
+    },
+    {
+      "ansatz": "adapt_uccsd_hybrid",
+      "n_down": 1,
+      "n_ops": 3,
+      "n_qubits": 4,
+      "n_up": 1,
+      "raw": {
+        "cx": 0,
+        "depth": 13,
+        "n_params": 3,
+        "ops": {
+          "PauliEvolution": 12,
+          "x": 2
+        },
+        "size": 14
+      },
+      "sites": 2,
+      "transpiled": {
+        "cx": 48,
+        "depth": 86,
+        "n_params": 3,
+        "ops": {
+          "cx": 48,
+          "rz": 59,
+          "sx": 31,
+          "x": 2
+        },
+        "size": 140
+      }
+    },
+    {
+      "ansatz": "uccsd",
+      "n_down": 1,
+      "n_qubits": 4,
+      "n_up": 1,
+      "raw": {
+        "cx": 0,
+        "depth": 1,
+        "n_params": 6,
+        "ops": {
+          "EvolvedOps": 1
+        },
+        "size": 1
+      },
+      "reps": 2,
+      "sites": 2,
+      "transpiled": {
+        "cx": 112,
+        "depth": 179,
+        "n_params": 6,
+        "ops": {
+          "cx": 112,
+          "rz": 109,
+          "sx": 57,
+          "x": 2
+        },
+        "size": 280
+      }
+    },
+    {
+      "ansatz": "adapt_cse_hybrid",
+      "n_down": 1,
+      "n_ops": 6,
+      "n_qubits": 6,
+      "n_up": 1,
+      "raw": {
+        "cx": 0,
+        "depth": 13,
+        "n_params": 6,
+        "ops": {
+          "PauliEvolution": 12,
+          "x": 2
+        },
+        "size": 14
+      },
+      "sites": 3,
+      "transpiled": {
+        "cx": 24,
+        "depth": 36,
+        "n_params": 6,
+        "ops": {
+          "cx": 24,
+          "rz": 55,
+          "sx": 27,
+          "x": 2
+        },
+        "size": 108
+      }
+    },
+    {
+      "ansatz": "vqe_cse_ops",
+      "n_down": 1,
+      "n_ops": 6,
+      "n_qubits": 6,
+      "n_up": 1,
+      "raw": {
+        "cx": 0,
+        "depth": 13,
+        "n_params": 6,
+        "ops": {
+          "PauliEvolution": 12,
+          "x": 2
+        },
+        "size": 14
+      },
+      "sites": 3,
+      "transpiled": {
+        "cx": 24,
+        "depth": 36,
+        "n_params": 6,
+        "ops": {
+          "cx": 24,
+          "rz": 55,
+          "sx": 27,
+          "x": 2
+        },
+        "size": 108
+      }
+    },
+    {
+      "ansatz": "adapt_uccsd_hybrid",
+      "n_down": 1,
+      "n_ops": 6,
+      "n_qubits": 6,
+      "n_up": 1,
+      "raw": {
+        "cx": 0,
+        "depth": 25,
+        "n_params": 6,
+        "ops": {
+          "PauliEvolution": 24,
+          "x": 2
+        },
+        "size": 26
+      },
+      "sites": 3,
+      "transpiled": {
+        "cx": 124,
+        "depth": 195,
+        "n_params": 6,
+        "ops": {
+          "cx": 124,
+          "rz": 125,
+          "sx": 63,
+          "x": 2
+        },
+        "size": 314
+      }
+    },
+    {
+      "ansatz": "uccsd",
+      "n_down": 1,
+      "n_qubits": 6,
+      "n_up": 1,
+      "raw": {
+        "cx": 0,
+        "depth": 1,
+        "n_params": 16,
+        "ops": {
+          "EvolvedOps": 1
+        },
+        "size": 1
+      },
+      "reps": 2,
+      "sites": 3,
+      "transpiled": {
+        "cx": 544,
+        "depth": 771,
+        "n_params": 16,
+        "ops": {
+          "cx": 544,
+          "rz": 387,
+          "sx": 203,
+          "x": 2
+        },
+        "size": 1136
+      }
+    },
+    {
+      "ansatz": "adapt_cse_hybrid",
+      "n_down": 1,
+      "n_ops": 6,
+      "n_qubits": 8,
+      "n_up": 1,
+      "raw": {
+        "cx": 0,
+        "depth": 13,
+        "n_params": 6,
+        "ops": {
+          "PauliEvolution": 12,
+          "x": 2
+        },
+        "size": 14
+      },
+      "sites": 4,
+      "transpiled": {
+        "cx": 24,
+        "depth": 36,
+        "n_params": 6,
+        "ops": {
+          "cx": 24,
+          "rz": 57,
+          "sx": 28,
+          "x": 2
+        },
+        "size": 111
+      }
+    },
+    {
+      "ansatz": "vqe_cse_ops",
+      "n_down": 1,
+      "n_ops": 6,
+      "n_qubits": 8,
+      "n_up": 1,
+      "raw": {
+        "cx": 0,
+        "depth": 13,
+        "n_params": 6,
+        "ops": {
+          "PauliEvolution": 12,
+          "x": 2
+        },
+        "size": 14
+      },
+      "sites": 4,
+      "transpiled": {
+        "cx": 24,
+        "depth": 36,
+        "n_params": 6,
+        "ops": {
+          "cx": 24,
+          "rz": 57,
+          "sx": 28,
+          "x": 2
+        },
+        "size": 111
+      }
+    },
+    {
+      "ansatz": "adapt_uccsd_hybrid",
+      "n_down": 1,
+      "n_ops": 6,
+      "n_qubits": 8,
+      "n_up": 1,
+      "raw": {
+        "cx": 0,
+        "depth": 19,
+        "n_params": 6,
+        "ops": {
+          "PauliEvolution": 18,
+          "x": 2
+        },
+        "size": 20
+      },
+      "sites": 4,
+      "transpiled": {
+        "cx": 92,
+        "depth": 138,
+        "n_params": 6,
+        "ops": {
+          "cx": 92,
+          "rz": 95,
+          "sx": 47,
+          "x": 2
+        },
+        "size": 236
+      }
+    },
+    {
+      "ansatz": "uccsd",
+      "n_down": 1,
+      "n_qubits": 8,
+      "n_up": 1,
+      "raw": {
+        "cx": 0,
+        "depth": 1,
+        "n_params": 30,
+        "ops": {
+          "EvolvedOps": 1
+        },
+        "size": 1
+      },
+      "reps": 2,
+      "sites": 4,
+      "transpiled": {
+        "cx": 1464,
+        "depth": 1946,
+        "n_params": 30,
+        "ops": {
+          "cx": 1464,
+          "rz": 817,
+          "sx": 433,
+          "x": 2
+        },
+        "size": 2716
+      }
+    },
+    {
+      "ansatz": "adapt_cse_hybrid",
+      "n_down": 1,
+      "n_ops": 6,
+      "n_qubits": 10,
+      "n_up": 1,
+      "raw": {
+        "cx": 0,
+        "depth": 13,
+        "n_params": 6,
+        "ops": {
+          "PauliEvolution": 12,
+          "x": 2
+        },
+        "size": 14
+      },
+      "sites": 5,
+      "transpiled": {
+        "cx": 24,
+        "depth": 42,
+        "n_params": 6,
+        "ops": {
+          "cx": 24,
+          "rz": 58,
+          "sx": 28,
+          "x": 2
+        },
+        "size": 112
+      }
+    },
+    {
+      "ansatz": "vqe_cse_ops",
+      "n_down": 1,
+      "n_ops": 6,
+      "n_qubits": 10,
+      "n_up": 1,
+      "raw": {
+        "cx": 0,
+        "depth": 13,
+        "n_params": 6,
+        "ops": {
+          "PauliEvolution": 12,
+          "x": 2
+        },
+        "size": 14
+      },
+      "sites": 5,
+      "transpiled": {
+        "cx": 24,
+        "depth": 42,
+        "n_params": 6,
+        "ops": {
+          "cx": 24,
+          "rz": 58,
+          "sx": 28,
+          "x": 2
+        },
+        "size": 112
+      }
+    },
+    {
+      "ansatz": "adapt_uccsd_hybrid",
+      "n_down": 1,
+      "n_ops": 6,
+      "n_qubits": 10,
+      "n_up": 1,
+      "raw": {
+        "cx": 0,
+        "depth": 19,
+        "n_params": 6,
+        "ops": {
+          "PauliEvolution": 18,
+          "x": 2
+        },
+        "size": 20
+      },
+      "sites": 5,
+      "transpiled": {
+        "cx": 92,
+        "depth": 138,
+        "n_params": 6,
+        "ops": {
+          "cx": 92,
+          "rz": 95,
+          "sx": 47,
+          "x": 2
+        },
+        "size": 236
+      }
+    },
+    {
+      "ansatz": "uccsd",
+      "n_down": 1,
+      "n_qubits": 10,
+      "n_up": 1,
+      "raw": {
+        "cx": 0,
+        "depth": 1,
+        "n_params": 48,
+        "ops": {
+          "EvolvedOps": 1
+        },
+        "size": 1
+      },
+      "reps": 2,
+      "sites": 5,
+      "transpiled": {
+        "cx": 3040,
+        "depth": 3873,
+        "n_params": 48,
+        "ops": {
+          "cx": 3040,
+          "rz": 1399,
+          "sx": 747,
+          "x": 2
+        },
+        "size": 5188
+      }
+    },
+    {
+      "ansatz": "adapt_cse_hybrid",
+      "n_down": 1,
+      "n_ops": 5,
+      "n_qubits": 12,
+      "n_up": 1,
+      "raw": {
+        "cx": 0,
+        "depth": 11,
+        "n_params": 5,
+        "ops": {
+          "PauliEvolution": 10,
+          "x": 2
+        },
+        "size": 12
+      },
+      "sites": 6,
+      "transpiled": {
+        "cx": 20,
+        "depth": 33,
+        "n_params": 5,
+        "ops": {
+          "cx": 20,
+          "rz": 49,
+          "sx": 24,
+          "x": 2
+        },
+        "size": 95
+      }
+    },
+    {
+      "ansatz": "vqe_cse_ops",
+      "n_down": 1,
+      "n_ops": 5,
+      "n_qubits": 12,
+      "n_up": 1,
+      "raw": {
+        "cx": 0,
+        "depth": 11,
+        "n_params": 5,
+        "ops": {
+          "PauliEvolution": 10,
+          "x": 2
+        },
+        "size": 12
+      },
+      "sites": 6,
+      "transpiled": {
+        "cx": 20,
+        "depth": 33,
+        "n_params": 5,
+        "ops": {
+          "cx": 20,
+          "rz": 49,
+          "sx": 24,
+          "x": 2
+        },
+        "size": 95
+      }
+    },
+    {
+      "ansatz": "adapt_uccsd_hybrid",
+      "n_down": 1,
+      "n_ops": 6,
+      "n_qubits": 12,
+      "n_up": 1,
+      "raw": {
+        "cx": 0,
+        "depth": 19,
+        "n_params": 6,
+        "ops": {
+          "PauliEvolution": 18,
+          "x": 2
+        },
+        "size": 20
+      },
+      "sites": 6,
+      "transpiled": {
+        "cx": 80,
+        "depth": 126,
+        "n_params": 6,
+        "ops": {
+          "cx": 80,
+          "rz": 93,
+          "sx": 46,
+          "x": 2
+        },
+        "size": 221
+      }
+    },
+    {
+      "ansatz": "uccsd",
+      "n_down": 1,
+      "n_qubits": 12,
+      "n_up": 1,
+      "raw": {
+        "cx": 0,
+        "depth": 1,
+        "n_params": 70,
+        "ops": {
+          "EvolvedOps": 1
+        },
+        "size": 1
+      },
+      "reps": 2,
+      "sites": 6,
+      "transpiled": {
+        "cx": 5440,
+        "depth": 6720,
+        "n_params": 70,
+        "ops": {
+          "cx": 5440,
+          "rz": 2133,
+          "sx": 1145,
+          "x": 2
+        },
+        "size": 8720
+      }
+    }
+  ]
+}

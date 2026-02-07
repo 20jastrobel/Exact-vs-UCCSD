@@ -27,7 +27,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--compare", type=str, default="runs/compare_vqe/compare_rows.json")
     ap.add_argument("--sites", nargs="*", type=int, default=[2, 3, 4, 5])
-    ap.add_argument("--metric", choices=["delta", "abs"], default="abs")
+    ap.add_argument("--metric", choices=["delta", "abs", "rel"], default="abs")
     ap.add_argument("--out", type=str, default="runs/compare_vqe/compare_bar_L2_L5.png")
     args = ap.parse_args()
 
@@ -47,8 +47,16 @@ def main() -> None:
         if delta is None:
             continue
         val = float(delta)
-        if args.metric == "abs":
+        if args.metric in ("abs", "rel"):
             val = abs(val)
+        if args.metric == "rel":
+            exact = row.get("exact")
+            if exact is None:
+                continue
+            denom = abs(float(exact))
+            if denom == 0.0:
+                continue
+            val = val / denom
         table[s][ansatz] = val
 
     # Ensure ordering and fill missing with NaN
@@ -79,7 +87,12 @@ def main() -> None:
 
     ax.set_xticks(x)
     ax.set_xticklabels([f"L={s}" for s in sites])
-    ylabel = "|ΔE|" if args.metric == "abs" else "ΔE"
+    if args.metric == "abs":
+        ylabel = "|ΔE|"
+    elif args.metric == "rel":
+        ylabel = "|ΔE| / |E_exact|"
+    else:
+        ylabel = "ΔE"
     ax.set_ylabel(ylabel)
     ax.set_title("Comparison by L and ansatz")
     ax.grid(True, axis="y", alpha=0.3)
