@@ -41,7 +41,11 @@ Benchmarking + plots:
 
 - `scripts/compare_vqe_hist.py`: produces the cached energy comparisons and plots under `runs/compare_vqe/`.
 - `scripts/plot_compare_bars.py`: utility for generating grouped bar charts from `compare_rows.json`.
+- `scripts/plot_cost_curves.py`: generates cost-normalized curves (`|ΔE|` vs primitive workload proxies like `n_circuits_executed`).
 - `scripts/benchmark_circuit_metrics.py`: benchmarks circuit depth / gate counts (raw + transpiled) for the cached comparison methods.
+- `pydephasing/quantum/vqe/cost_model.py`: `CountingEstimator` wrapper and `CostCounters` used to log cost counters into `history.jsonl`.
+- `scripts/benchmark_state_quality.py`: computes state-quality metrics beyond energy (Var(H), fidelity, observables, sector leakage).
+- `scripts/benchmark_grouped_generator_approx.py`: microbenchmark for grouped-generator implementation error (sum-form vs product-form evolution).
 
 Deep-research context:
 
@@ -109,9 +113,14 @@ Circuit metrics benchmarking:
 
 Important caching/sector note:
 
-- `runs/compare_vqe/compare_rows.json` currently stores `L`, ansatz kind, and energies, but does not include `n_up/n_down`.
-- As of 2026-02-07, the cached comparison rows under `runs/compare_vqe/` correspond to the fixed sector `(n_up,n_down)=(1,1)` for `L=2..6` (not half-filling for `L>2`).
+- `runs/compare_vqe/compare_rows.json` is expected to include sector fields (`n_up`, `n_down`, `N`, `Sz`, `filling`) so comparisons are not silently mixing different particle sectors.
+- Legacy cached comparison rows (generated before sector fields and sector-aware cache keys) may correspond to the fixed sector `(n_up,n_down)=(1,1)` for `L=2..6` (i.e., constant `N=2` as `L` grows). Do not treat those as "half-filling" results.
 - The per-run ADAPT logs under `runs/<run_id>_L*_Nup*_Ndown*/meta.json` are the source of truth for sector and settings.
+
+Cost-normalized benchmarking:
+
+- The energy benchmark plus circuit metrics alone can be misleading: ADAPT can spend most of its budget on pool-wide gradient probes.
+- We instrument runs with primitive workload counters (`n_estimator_calls`, `n_circuits_executed`, `n_pauli_terms_measured`, plus coarse `n_energy_evals/n_grad_evals`) and plot best-so-far `|ΔE|` versus these proxies via `scripts/plot_cost_curves.py`.
 
 ## Common Failure Modes / Why Comparisons Vary
 

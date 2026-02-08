@@ -1,0 +1,20 @@
+{
+  "best_energy": -0.506312970693456,
+  "budget": {
+    "budget_k": 2000.0,
+    "max_circuits_executed": null,
+    "max_pauli_terms_measured": 8000,
+    "max_time_s": null
+  },
+  "energy": -0.506312970693456,
+  "operators": [
+    "gamma_im(+_0 -_1)",
+    "gamma_im(+_2 -_3)"
+  ],
+  "pool": "cse_density_ops",
+  "stop_reason": "eps_grad",
+  "theta": [
+    2.5609746954950108,
+    0.4796951899699793
+  ]
+}

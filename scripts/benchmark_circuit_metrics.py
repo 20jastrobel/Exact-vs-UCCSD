@@ -31,7 +31,7 @@ from pydephasing.quantum.hamiltonian.hubbard import (
     build_qubit_hamiltonian_from_fermionic,
     default_1d_chain_edges,
 )
-from pydephasing.quantum.utils_particles import half_filling_num_particles
+from pydephasing.quantum.utils_particles import half_filling_sector
 from pydephasing.quantum.vqe.adapt_vqe_meta import (
     build_adapt_circuit_grouped,
     build_cse_density_pool_from_fermionic,
@@ -98,47 +98,6 @@ def chosen_operator_names_from_run_dir(run_dir: Path) -> list[str]:
     return [str(x) for x in chosen]
 
 
-def infer_sector_from_cache(
-    runs_root: Path,
-    *,
-    n_sites: int,
-    pool: str,
-) -> tuple[int, int] | None:
-    """Infer (n_up, n_down) from the newest cached run matching (L, pool)."""
-    candidates: list[tuple[float, int, int]] = []
-    for run_dir in runs_root.iterdir():
-        if not run_dir.is_dir():
-            continue
-        meta_path = run_dir / "meta.json"
-        if not meta_path.exists():
-            continue
-        try:
-            meta = json.loads(meta_path.read_text())
-        except Exception:
-            continue
-        try:
-            sites_meta = int(meta.get("sites", -1))
-        except Exception:
-            continue
-        if sites_meta != int(n_sites):
-            continue
-        if str(meta.get("pool")) != str(pool):
-            continue
-        if meta.get("n_up") is None or meta.get("n_down") is None:
-            continue
-        try:
-            n_up = int(meta["n_up"])
-            n_down = int(meta["n_down"])
-        except Exception:
-            continue
-        candidates.append((run_dir.stat().st_mtime, n_up, n_down))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    _mtime, n_up, n_down = candidates[0]
-    return int(n_up), int(n_down)
-
-
 def circuit_metrics(qc) -> dict:
     ops = qc.count_ops()
     return {
@@ -166,6 +125,18 @@ def _resolve_cse_spec_name(name: str, spec_map: dict[str, dict]) -> str | None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--sites", nargs="*", type=int, default=[2, 3, 4, 5, 6])
+    ap.add_argument(
+        "--odd-policy",
+        type=str,
+        choices=["min_sz", "restrict", "dope_sz0"],
+        default="min_sz",
+        help=(
+            "Half-filling sector policy for odd L. "
+            "min_sz: (n_up,n_down)=((L+1)/2,(L-1)/2) (Sz=+1/2). "
+            "restrict: error for odd L. "
+            "dope_sz0: nearest Sz=0 sector (NOT half-filling): N=L-1."
+        ),
+    )
     ap.add_argument("--n-up", type=int, default=None, help="Override and use fixed n_up for all L.")
     ap.add_argument("--n-down", type=int, default=None, help="Override and use fixed n_down for all L.")
     ap.add_argument("--t", type=float, default=1.0)
@@ -186,19 +157,14 @@ def main() -> None:
     if (args.n_up is None) != (args.n_down is None):
         raise ValueError("Pass both --n-up and --n-down, or neither.")
 
-    # Prefer matching whatever was cached for comparison runs; otherwise fall back to half-filling.
+    # Default: enforce half-filling sectors for each L (spinful Hubbard convention: N_total = L).
     sectors: dict[int, tuple[int, int]] = {}
     for n in sites:
         if args.n_up is not None and args.n_down is not None:
             sectors[n] = (int(args.n_up), int(args.n_down))
             continue
-        sec = infer_sector_from_cache(runs_root, n_sites=n, pool="cse_density_ops")
-        if sec is None:
-            sec = infer_sector_from_cache(runs_root, n_sites=n, pool="uccsd_excitations")
-        if sec is None:
-            # Half-filling per size: N_total = L. For odd L, Sz=0 is impossible, so pick Sz=+0.5.
-            sec = half_filling_num_particles(n, sz_target=0.0 if n % 2 == 0 else 0.5)
-        sectors[n] = (int(sec[0]), int(sec[1]))
+        n_up, n_down = half_filling_sector(int(n), odd_policy=args.odd_policy)
+        sectors[n] = (int(n_up), int(n_down))
 
     rows: list[dict] = []
     t0 = time.perf_counter()

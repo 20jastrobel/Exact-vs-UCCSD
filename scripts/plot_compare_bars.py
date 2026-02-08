@@ -27,9 +27,26 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--compare", type=str, default="runs/compare_vqe/compare_rows.json")
     ap.add_argument("--sites", nargs="*", type=int, default=[2, 3, 4, 5])
+    ap.add_argument(
+        "--half-filling",
+        action="store_true",
+        default=True,
+        help="Filter rows to half-filling sectors (default: True).",
+    )
+    ap.add_argument(
+        "--no-half-filling",
+        dest="half_filling",
+        action="store_false",
+        help="Do not filter rows to half-filling sectors.",
+    )
+    ap.add_argument("--n-up", type=int, default=None, help="Optional sector filter: n_up (requires --n-down).")
+    ap.add_argument("--n-down", type=int, default=None, help="Optional sector filter: n_down (requires --n-up).")
     ap.add_argument("--metric", choices=["delta", "abs", "rel"], default="abs")
     ap.add_argument("--out", type=str, default="runs/compare_vqe/compare_bar_L2_L5.png")
     args = ap.parse_args()
+
+    if (args.n_up is None) != (args.n_down is None):
+        raise ValueError("Pass both --n-up and --n-down, or neither.")
 
     rows = load_rows(Path(args.compare))
     sites = sorted(set(int(s) for s in args.sites))
@@ -40,6 +57,21 @@ def main() -> None:
         s = int(row.get("sites"))
         if s not in table:
             continue
+        # Optional sector filtering.
+        if args.n_up is not None and args.n_down is not None:
+            if int(row.get("n_up", -999)) != int(args.n_up) or int(row.get("n_down", -999)) != int(args.n_down):
+                continue
+        elif args.half_filling:
+            # Half-filling for spinful Hubbard convention: N_total = L.
+            if row.get("N") is not None:
+                if int(row.get("N")) != int(s):
+                    continue
+            elif row.get("n_up") is not None and row.get("n_down") is not None:
+                if int(row.get("n_up")) + int(row.get("n_down")) != int(s):
+                    continue
+            else:
+                # Legacy row schema without sector information.
+                continue
         ansatz = str(row.get("ansatz"))
         if ansatz not in ANSATZ_ORDER:
             continue

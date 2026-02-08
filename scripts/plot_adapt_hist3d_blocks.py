@@ -71,7 +71,14 @@ def load_run(run_dir: Path) -> tuple[dict, list[dict]]:
     return meta, hist
 
 
-def discover_latest_run_for_site(runs_root: Path, site: int, *, pool: str = "cse_density_ops") -> Path:
+def discover_latest_run_for_site(
+    runs_root: Path,
+    site: int,
+    *,
+    pool: str = "cse_density_ops",
+    n_up: int | None = None,
+    n_down: int | None = None,
+) -> Path:
     latest_path: Path | None = None
     latest_mtime = -np.inf
     for run_dir in runs_root.iterdir():
@@ -84,11 +91,20 @@ def discover_latest_run_for_site(runs_root: Path, site: int, *, pool: str = "cse
         try:
             meta = load_json(meta_path)
             sites = int(meta.get("sites"))
+            n_up_meta = int(meta.get("n_up", -1))
+            n_down_meta = int(meta.get("n_down", -1))
         except Exception:
             continue
         if sites != site:
             continue
         if pool and str(meta.get("pool")) != pool:
+            continue
+        # Require sector information and optionally filter to a specific sector.
+        if n_up_meta < 0 or n_down_meta < 0:
+            continue
+        if n_up is not None and int(n_up_meta) != int(n_up):
+            continue
+        if n_down is not None and int(n_down_meta) != int(n_down):
             continue
         mtime = meta_path.stat().st_mtime
         if mtime > latest_mtime:
@@ -106,10 +122,14 @@ def load_compare_rows(path: Path) -> list[dict]:
     return rows
 
 
-def regular_delta_e_by_ansatz(rows: list[dict], sites: int) -> dict[str, float]:
+def regular_delta_e_by_ansatz(rows: list[dict], sites: int, *, n_up: int, n_down: int) -> dict[str, float]:
     out: dict[str, float] = {}
     for row in rows:
         if int(row.get("sites")) != sites:
+            continue
+        if row.get("n_up") is None or row.get("n_down") is None:
+            continue
+        if int(row.get("n_up")) != int(n_up) or int(row.get("n_down")) != int(n_down):
             continue
         ansatz = str(row.get("ansatz"))
         delta = row.get("delta_e")
@@ -117,6 +137,28 @@ def regular_delta_e_by_ansatz(rows: list[dict], sites: int) -> dict[str, float]:
             continue
         out[ansatz] = float(delta)
     return out
+
+
+def sector_for_site_from_compare_rows(*, rows: list[dict], sites: int, require_half_filling: bool = True) -> tuple[int, int]:
+    """Infer a unique (n_up,n_down) sector for a site from compare_rows.json."""
+    sectors: set[tuple[int, int]] = set()
+    for row in rows:
+        if int(row.get("sites", -1)) != int(sites):
+            continue
+        if row.get("n_up") is None or row.get("n_down") is None:
+            continue
+        n_up = int(row.get("n_up"))
+        n_down = int(row.get("n_down"))
+        if require_half_filling:
+            n_total = int(row.get("N", n_up + n_down))
+            if n_total != int(sites):
+                continue
+        sectors.add((n_up, n_down))
+    if not sectors:
+        raise ValueError(f"No sector info found in compare rows for L={sites}.")
+    if len(sectors) != 1:
+        raise ValueError(f"Multiple sectors found in compare rows for L={sites}: {sorted(sectors)}")
+    return next(iter(sectors))
 
 
 def build_adapt_series(run_dir: Path) -> AdaptSeries:
@@ -577,29 +619,41 @@ def build_count_plot(
     )
 
 
-def main(sites: Iterable[int] = (2, 3, 4), *, mode: str = "all", interactive: bool = False) -> None:
+def main(
+    sites: Iterable[int] = (2, 3, 4),
+    *,
+    mode: str = "all",
+    interactive: bool = False,
+    compare_dir: str = "runs/compare_vqe",
+) -> None:
     runs_root = Path("runs")
-    compare_rows_path = runs_root / "compare_vqe" / "compare_rows.json"
+    out_dir = Path(compare_dir)
+    compare_rows_path = out_dir / "compare_rows.json"
     rows = load_compare_rows(compare_rows_path)
-
-    out_dir = runs_root / "compare_vqe"
 
     for site in sites:
         site_i = int(site)
-        run_dir = discover_latest_run_for_site(runs_root, site_i, pool="cse_density_ops")
+        n_up, n_down = sector_for_site_from_compare_rows(rows=rows, sites=site_i, require_half_filling=True)
+        run_dir = discover_latest_run_for_site(
+            runs_root,
+            site_i,
+            pool="cse_density_ops",
+            n_up=n_up,
+            n_down=n_down,
+        )
         adapt = build_adapt_series(run_dir)
-        regular_delta = regular_delta_e_by_ansatz(rows, site_i)
+        regular_delta = regular_delta_e_by_ansatz(rows, site_i, n_up=n_up, n_down=n_down)
         regular_series: dict[str, RegularSeries] = {}
         for ansatz in ANSATZ_ORDER:
             if ansatz == "adapt_cse_hybrid":
                 continue
-            log_dir = out_dir / f"logs_{ansatz}_L{site_i}"
+            log_dir = out_dir / f"logs_{ansatz}_L{site_i}_Nup{n_up}_Ndown{n_down}"
             series = load_regular_series(log_dir, ansatz)
             if series is not None:
                 regular_series[ansatz] = series
 
         def emit_interactive(bars: list[BarSpec], title: str, ylabel: str, name: str) -> None:
-            out_path = out_dir / f"{name}_L{site_i}_interactive.html"
+            out_path = out_dir / f"{name}_L{site_i}_Nup{n_up}_Ndown{n_down}_interactive.html"
             _interactive_bar3d(
                 bars=bars,
                 title=title,
@@ -614,7 +668,7 @@ def main(sites: Iterable[int] = (2, 3, 4), *, mode: str = "all", interactive: bo
                     regular_series=regular_series,
                     adapt=adapt,
                 )
-                emit_interactive(bars, f"L={site_i}: ΔE by ansatz with iteration axis", "iteration n",
+                emit_interactive(bars, f"L={site_i} (Nup={n_up},Ndown={n_down}): ΔE by ansatz with iteration axis", "iteration n",
                                  "delta_e_hist3d_ansatz_iter")
             else:
                 build_iter_plot(
@@ -622,7 +676,7 @@ def main(sites: Iterable[int] = (2, 3, 4), *, mode: str = "all", interactive: bo
                     regular_delta=regular_delta,
                     regular_series=regular_series,
                     adapt=adapt,
-                    out_path=out_dir / f"delta_e_hist3d_ansatz_iter_L{site_i}.png",
+                    out_path=out_dir / f"delta_e_hist3d_ansatz_iter_L{site_i}_Nup{n_up}_Ndown{n_down}.png",
                 )
         if mode in {"all", "time"}:
             if interactive:
@@ -633,7 +687,7 @@ def main(sites: Iterable[int] = (2, 3, 4), *, mode: str = "all", interactive: bo
                 )
                 emit_interactive(
                     bars,
-                    f"L={site_i}: ΔE by ansatz with cumulative time axis",
+                    f"L={site_i} (Nup={n_up},Ndown={n_down}): ΔE by ansatz with cumulative time axis",
                     "cumulative wall time t^(n) [s]",
                     "delta_e_hist3d_ansatz_time",
                 )
@@ -643,7 +697,7 @@ def main(sites: Iterable[int] = (2, 3, 4), *, mode: str = "all", interactive: bo
                     regular_delta=regular_delta,
                     regular_series=regular_series,
                     adapt=adapt,
-                    out_path=out_dir / f"delta_e_hist3d_ansatz_time_L{site_i}.png",
+                    out_path=out_dir / f"delta_e_hist3d_ansatz_time_L{site_i}_Nup{n_up}_Ndown{n_down}.png",
                 )
         if mode in {"all", "exec", "eval"}:
             num_terms, num_groups = _measurement_counts_for_site(site_i)
@@ -657,7 +711,7 @@ def main(sites: Iterable[int] = (2, 3, 4), *, mode: str = "all", interactive: bo
                     )
                     emit_interactive(
                         bars,
-                        f"L={site_i}: ΔE by ansatz with estimated circuit executions axis",
+                        f"L={site_i} (Nup={n_up},Ndown={n_down}): ΔE by ansatz with estimated circuit executions axis",
                         "estimated circuit executions",
                         "delta_e_hist3d_ansatz_exec",
                     )
@@ -667,7 +721,7 @@ def main(sites: Iterable[int] = (2, 3, 4), *, mode: str = "all", interactive: bo
                         regular_delta=regular_delta,
                         regular_series=regular_series,
                         adapt=adapt,
-                        out_path=out_dir / f"delta_e_hist3d_ansatz_exec_L{site_i}.png",
+                        out_path=out_dir / f"delta_e_hist3d_ansatz_exec_L{site_i}_Nup{n_up}_Ndown{n_down}.png",
                         count_label="estimated circuit executions",
                         count_factor=num_groups,
                     )
@@ -681,7 +735,7 @@ def main(sites: Iterable[int] = (2, 3, 4), *, mode: str = "all", interactive: bo
                     )
                     emit_interactive(
                         bars,
-                        f"L={site_i}: ΔE by ansatz with estimated energy expectation values axis",
+                        f"L={site_i} (Nup={n_up},Ndown={n_down}): ΔE by ansatz with estimated energy expectation values axis",
                         "estimated energy expectation values",
                         "delta_e_hist3d_ansatz_eval",
                     )
@@ -691,7 +745,7 @@ def main(sites: Iterable[int] = (2, 3, 4), *, mode: str = "all", interactive: bo
                         regular_delta=regular_delta,
                         regular_series=regular_series,
                         adapt=adapt,
-                        out_path=out_dir / f"delta_e_hist3d_ansatz_eval_L{site_i}.png",
+                        out_path=out_dir / f"delta_e_hist3d_ansatz_eval_L{site_i}_Nup{n_up}_Ndown{n_down}.png",
                         count_label="estimated energy expectation values",
                         count_factor=num_terms,
                     )
@@ -702,5 +756,6 @@ if __name__ == "__main__":
     parser.add_argument("--sites", nargs="*", type=int, default=[2, 3, 4])
     parser.add_argument("--mode", choices=["all", "iter", "time", "exec", "eval"], default="all")
     parser.add_argument("--interactive", action="store_true")
+    parser.add_argument("--compare-dir", type=str, default="runs/compare_vqe")
     args = parser.parse_args()
-    main(args.sites, mode=args.mode, interactive=args.interactive)
+    main(args.sites, mode=args.mode, interactive=args.interactive, compare_dir=args.compare_dir)

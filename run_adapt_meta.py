@@ -27,6 +27,7 @@ from pydephasing.quantum.vqe.adapt_vqe_meta import (
 )
 from pydephasing.quantum.vqe.meta_lstm_optimizer import CoordinateWiseLSTMOptimizer
 from pydephasing.quantum.vqe.meta_lstm import load_meta_lstm, CoordinateWiseLSTM
+from pydephasing.quantum.vqe.cost_model import CostCounters, CountingEstimator
 from pydephasing.quantum.symmetry import (
     exact_ground_energy_sector,
     map_symmetry_ops_to_qubits,
@@ -134,6 +135,7 @@ def make_run_dir_and_meta(args) -> Path:
             "u": getattr(args, "u", None),
             "dv": getattr(args, "dv", None),
         },
+        "budget": getattr(args, "budget", None),
         "exact_energy": None,
         "python": sys.version,
         "platform": platform.platform(),
@@ -199,8 +201,15 @@ def main() -> None:
     parser.add_argument("--theta-init-noise", type=float, default=0.0)
     parser.add_argument("--lbfgs-restarts", type=int, default=3)
     parser.add_argument("--allow-repeats", action="store_true")
+    parser.add_argument("--compute-var-h", dest="compute_var_h", action="store_true", default=False)
+    parser.add_argument("--no-compute-var-h", dest="compute_var_h", action="store_false")
     parser.add_argument("--enforce-sector", action="store_true", default=True)
     parser.add_argument("--no-enforce-sector", dest="enforce_sector", action="store_false")
+    parser.add_argument("--budget-k", type=float, default=2000.0)
+    parser.add_argument("--no-budget", action="store_true")
+    parser.add_argument("--max-pauli-terms", type=int, default=None)
+    parser.add_argument("--max-circuits", type=int, default=None)
+    parser.add_argument("--max-time-s", type=float, default=None)
     parser.add_argument(
         "--pool",
         type=str,
@@ -227,6 +236,31 @@ def main() -> None:
 
     if args.pool == "uccsd":
         args.pool = "uccsd_excitations"
+
+    if args.no_budget:
+        pauli_budget = None
+        max_circuits_executed = None
+        max_time_s = None
+    else:
+        pauli_budget = (
+            int(args.max_pauli_terms)
+            if args.max_pauli_terms is not None
+            else int(float(args.budget_k) * (int(args.sites) ** 2))
+        )
+        max_circuits_executed = (
+            int(args.max_circuits) if args.max_circuits is not None else None
+        )
+        max_time_s = float(args.max_time_s) if args.max_time_s is not None else None
+
+    args.budget = {
+        "enabled": bool(not args.no_budget),
+        "budget_k": float(args.budget_k),
+        "max_pauli_terms_measured": None if pauli_budget is None else int(pauli_budget),
+        "max_circuits_executed": None
+        if max_circuits_executed is None
+        else int(max_circuits_executed),
+        "max_time_s": None if max_time_s is None else float(max_time_s),
+    }
 
     ferm_op = build_fermionic_hubbard(
         n_sites=args.sites,
@@ -319,7 +353,8 @@ def main() -> None:
         weights = _load_weights(args.weights)
     lstm = CoordinateWiseLSTMOptimizer(seed=args.seed, weights=weights) if weights else CoordinateWiseLSTMOptimizer(seed=args.seed)
 
-    estimator = StatevectorEstimator()
+    cost = CostCounters()
+    estimator = CountingEstimator(StatevectorEstimator(), cost)
     try:
         result = run_meta_adapt_vqe(
             qubit_op,
@@ -327,39 +362,44 @@ def main() -> None:
             estimator,
             max_depth=args.max_depth,
             inner_steps=args.inner_steps,
-        eps_grad=args.eps_grad,
-        eps_energy=args.eps_energy,
-        lstm_optimizer=lstm,
-        meta_model=meta_model,
-        seed=args.seed,
-        pool_mode=args.pool,
-        ferm_op=ferm_op,
-        mapper=_mapper,
-        n_sites=args.sites,
-        n_up=args.n_up,
-        n_down=args.n_down,
-        enforce_sector=args.enforce_sector,
-        cse_include_diagonal=args.cse_include_diagonal,
-        cse_include_antihermitian_part=args.cse_include_antihermitian,
-        cse_include_hermitian_part=args.cse_include_hermitian,
-        uccsd_reps=args.uccsd_reps,
-        uccsd_include_imaginary=args.uccsd_include_imaginary,
-        uccsd_generalized=args.uccsd_generalized,
-        uccsd_preserve_spin=args.uccsd_preserve_spin,
-        r=args.meta_r,
-        inner_optimizer=args.inner_optimizer,
-        theta_bound=args.theta_bound,
-        meta_step_scale=args.meta_step_scale,
-        meta_dtheta_clip=args.meta_dtheta_clip,
-        meta_warmup_steps=args.meta_warmup_steps,
-        lbfgs_maxiter=args.inner_steps,
-        lbfgs_restarts=args.lbfgs_restarts,
-        theta_init_noise=args.theta_init_noise,
-        allow_repeats=args.allow_repeats,
-        warmup_steps=args.warmup_steps,
-        polish_steps=args.polish_steps,
+            eps_grad=args.eps_grad,
+            eps_energy=args.eps_energy,
+            lstm_optimizer=lstm,
+            meta_model=meta_model,
+            seed=args.seed,
+            pool_mode=args.pool,
+            ferm_op=ferm_op,
+            mapper=_mapper,
+            n_sites=args.sites,
+            n_up=args.n_up,
+            n_down=args.n_down,
+            enforce_sector=args.enforce_sector,
+            cse_include_diagonal=args.cse_include_diagonal,
+            cse_include_antihermitian_part=args.cse_include_antihermitian,
+            cse_include_hermitian_part=args.cse_include_hermitian,
+            uccsd_reps=args.uccsd_reps,
+            uccsd_include_imaginary=args.uccsd_include_imaginary,
+            uccsd_generalized=args.uccsd_generalized,
+            uccsd_preserve_spin=args.uccsd_preserve_spin,
+            r=args.meta_r,
+            inner_optimizer=args.inner_optimizer,
+            theta_bound=args.theta_bound,
+            meta_step_scale=args.meta_step_scale,
+            meta_dtheta_clip=args.meta_dtheta_clip,
+            meta_warmup_steps=args.meta_warmup_steps,
+            lbfgs_maxiter=args.inner_steps,
+            lbfgs_restarts=args.lbfgs_restarts,
+            theta_init_noise=args.theta_init_noise,
+            allow_repeats=args.allow_repeats,
+            warmup_steps=args.warmup_steps,
+            polish_steps=args.polish_steps,
             meta_alpha0=args.meta_alpha0,
             meta_alpha_k=args.meta_alpha_k,
+            max_pauli_terms_measured=pauli_budget,
+            max_circuits_executed=max_circuits_executed,
+            max_time_s=max_time_s,
+            cost_counters=cost,
+            compute_var_h=args.compute_var_h,
             logger=logger,
             log_every=args.log_every,
             verbose=not args.quiet,
@@ -376,6 +416,17 @@ def main() -> None:
         0.5 * (args.n_up - args.n_down),
     )
     update_meta_exact_energy(run_dir, exact_sector)
+
+    # Persist final parameters and operator sequence for downstream benchmarking
+    # (fidelity/variance/observables reconstruction, etc.).
+    ops_out: list[str] = []
+    for op in result.operators:
+        if isinstance(op, dict) and "name" in op:
+            ops_out.append(str(op["name"]))
+        else:
+            ops_out.append(str(op))
+    _save_result(str(run_dir / "result.json"), result.energy, result.params, ops_out)
+
     print(f"Exact ground energy (full):   {exact:.8f}")
     print(f"Exact ground energy (sector): {exact_sector:.8f}")
     print(f"Meta-ADAPT energy:            {result.energy:.8f}")

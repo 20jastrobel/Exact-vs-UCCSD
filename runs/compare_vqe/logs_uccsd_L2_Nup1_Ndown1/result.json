@@ -1,0 +1,30 @@
+{
+  "ansatz": "uccsd",
+  "budget": {
+    "max_circuits_executed": null,
+    "max_pauli_terms_measured": 8000,
+    "max_time_s": 200.0
+  },
+  "energy": -0.8360570023008024,
+  "n_params": 6,
+  "n_sites": 2,
+  "num_particles": [
+    1,
+    1
+  ],
+  "optimal_point": [
+    0.47647372772351376,
+    0.0902252825674604,
+    -0.8473265216580301,
+    1.490355270440116,
+    -0.028456896992156085,
+    0.7085122917530338
+  ],
+  "optimizer": {
+    "maxiter": 100000,
+    "name": "COBYLA"
+  },
+  "reps": 2,
+  "seed": 7,
+  "stop_reason": null
+}

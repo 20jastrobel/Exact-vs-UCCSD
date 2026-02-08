@@ -1,0 +1,25 @@
+{
+  "ansatz": "vqe_cse_ops",
+  "budget": {
+    "max_circuits_executed": null,
+    "max_pauli_terms_measured": 8000,
+    "max_time_s": 200.0
+  },
+  "energy": -0.5063129607298411,
+  "n_params": 2,
+  "n_sites": 2,
+  "num_particles": [
+    1,
+    1
+  ],
+  "optimal_point": [
+    2.560912662354054,
+    0.4796320620420622
+  ],
+  "optimizer": {
+    "maxiter": 100000,
+    "name": "COBYLA"
+  },
+  "seed": 7,
+  "stop_reason": null
+}

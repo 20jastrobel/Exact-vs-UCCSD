@@ -1,0 +1,18 @@
+{
+  "best_energy": -0.2655644370742758,
+  "budget": {
+    "budget_k": 200.0,
+    "max_circuits_executed": null,
+    "max_pauli_terms_measured": 800,
+    "max_time_s": 200.0
+  },
+  "energy": 0.7209224416276596,
+  "operators": [
+    "uccsd_exc(((0,), (1,)))"
+  ],
+  "pool": "uccsd_excitations",
+  "stop_reason": "budget:max_pauli_terms_measured",
+  "theta": [
+    -2.622447138422766
+  ]
+}

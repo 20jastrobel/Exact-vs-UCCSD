@@ -35,6 +35,35 @@ def half_filling_num_particles(n_sites: int, *, sz_target: float = 0.0) -> tuple
     return int(n_up), int(n_down)
 
 
+def half_filling_sector(n_sites: int, *, odd_policy: str = "min_sz") -> tuple[int, int]:
+    """
+    Half-filling sector for the spinful Hubbard convention used in this repo:
+      - 2*n_sites spin orbitals
+      - half-filling means N_total = n_sites electrons
+
+    Policy for odd n_sites:
+      - "min_sz": choose minimal |Sz| (Sz=+1/2), i.e. (n_up,n_down)=((L+1)/2,(L-1)/2)
+      - "restrict": raise (requires even L for Sz=0)
+      - "dope_sz0": choose the nearest Sz=0 sector (NOT exact half-filling): N_total = L-1
+    """
+    n_sites = int(n_sites)
+    if n_sites < 1:
+        raise ValueError("n_sites must be >= 1")
+
+    if n_sites % 2 == 0:
+        return n_sites // 2, n_sites // 2
+
+    odd_policy = str(odd_policy)
+    if odd_policy == "min_sz":
+        return (n_sites + 1) // 2, (n_sites - 1) // 2
+    if odd_policy == "restrict":
+        raise ValueError(f"Sz=0 half-filling requires even n_sites; got n_sites={n_sites}")
+    if odd_policy == "dope_sz0":
+        # Nearest Sz=0 sector; note this is NOT half-filling (N_total = L-1).
+        return (n_sites - 1) // 2, (n_sites - 1) // 2
+    raise ValueError(f"unknown odd_policy={odd_policy!r}")
+
+
 def jw_reference_occupations_from_particles(n_sites: int, n_up: int, n_down: int) -> list[int]:
     """
     Occupied spin-orbital indices for Jordan-Wigner ordering used in this repo:
@@ -47,4 +76,3 @@ def jw_reference_occupations_from_particles(n_sites: int, n_up: int, n_down: int
     if not (0 <= n_up <= n_sites and 0 <= n_down <= n_sites):
         raise ValueError("n_up and n_down must be between 0 and n_sites.")
     return list(range(n_up)) + list(range(n_sites, n_sites + n_down))
-

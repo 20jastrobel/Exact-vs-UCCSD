@@ -8,10 +8,18 @@ Artifacts (latest in this workspace):
 
 - Energy comparison rows: `runs/compare_vqe/compare_rows.json`
 - Energy bar plots: `runs/compare_vqe/compare_bar_abs_L2_L3_L4_L5_L6.png`, `runs/compare_vqe/compare_bar_rel_L2_L3_L4_L5_L6.png`
+- Cost curves (error vs compute proxy): `runs/compare_vqe/cost_curve_abs_delta_e_vs_n_circuits_executed_L*_Nup*_Ndown*.png`
 - Circuit metrics rows: `runs/compare_vqe/circuit_metrics.json`
 - Circuit metrics plot: `runs/compare_vqe/circuit_metrics_depth.png`
+- State-quality summary: `runs/compare_vqe/state_quality_summary.md`
+- State-quality plots: `runs/compare_vqe/state_quality_var_h.png`, `runs/compare_vqe/state_quality_infidelity.png`, `runs/compare_vqe/state_quality_p_leak.png`
+- ADAPT leakage trajectories: `runs/compare_vqe/leakage_traj.json` and `runs/compare_vqe/leakage_vs_depth_L*.png`
 - Energy comparison driver: `scripts/compare_vqe_hist.py`
+- Cost curve driver: `scripts/plot_cost_curves.py`
 - Circuit metrics driver: `scripts/benchmark_circuit_metrics.py`
+- State-quality driver: `scripts/benchmark_state_quality.py`
+- Grouped-generator microbenchmark: `scripts/benchmark_grouped_generator_approx.py`
+- Cost counters implementation: `pydephasing/quantum/vqe/cost_model.py`
 
 ## What We Benchmark
 
@@ -19,6 +27,7 @@ We benchmark two main things:
 
 - Energy accuracy: energy error versus the exact ground-state energy in the same symmetry sector.
 - Circuit structure: circuit depth and two-qubit gate counts (CX) for the final ansatz circuits.
+- Compute budget (cost-normalized): error versus *true primitive workload proxies* (estimator calls, circuits executed, Pauli terms measured).
 
 ## Model / Setup (Applies to All Results Below)
 
@@ -35,8 +44,11 @@ Mapping / simulation:
 
 Symmetry sector (important):
 
-- The current cached comparison results are in the fixed sector `(n_up, n_down) = (1, 1)` for all `L in {2,3,4,5,6}`.
-- That means `N_total=2` and `Sz=0` for every system size. This is **not** half-filling for `L>2`.
+- The intended comparison regime is **half filling** for the spinful Hubbard convention used here:
+  - `N_total = n_up + n_down = L`
+  - if `L` is even: `n_up = n_down = L/2` (Sz=0)
+  - if `L` is odd: Sz=0 is impossible at half filling; we choose minimal `|Sz|` (default Sz=+1/2), i.e. `n_up=(L+1)/2`, `n_down=(L-1)/2`
+- Legacy cached results may have been produced in a fixed sector `(n_up,n_down)=(1,1)` for all `L` (constant `N=2`), which is **not** half-filling for `L>2`. Always check `runs/compare_vqe/compare_rows.json` for `n_up/n_down/N/filling`.
 
 Exact reference energy:
 
@@ -92,8 +104,75 @@ Per system size `L`:
 - For each ansatz kind:
   - ADAPT runs: `run_meta_adapt_vqe(...)` with the given pool mode and `StatevectorEstimator`.
   - VQE runs: `qiskit_algorithms.VQE` with `StatevectorEstimator` and `COBYLA`.
-- Store `{sites, ansatz, energy, exact, delta_e}` in `runs/compare_vqe/compare_rows.json`.
+- Store comparison rows in `runs/compare_vqe/compare_rows.json` including at least:
+  - `sites` (L), `n_up`, `n_down`, `N`, `Sz`, `filling`
+  - `ansatz`, `energy`, `exact`, `delta_e` (plus optional `error`)
 - Generate bar plots of `abs(delta_e)` and `abs(delta_e)/abs(exact)` in `runs/compare_vqe/`.
+
+## Cost-Normalized Benchmarking (Error vs Compute Proxy)
+
+Motivation:
+
+- ADAPT has a large fixed overhead per outer iteration due to *pool-wide gradient probes* (scales with pool size).
+- Regular VQE spends most of its budget on optimizer-driven energy evaluations (scales with parameter count and optimizer behavior).
+
+Implementation:
+
+- We wrap `StatevectorEstimator` (and any `BaseEstimatorV2`) with `CountingEstimator` (`pydephasing/quantum/vqe/cost_model.py`) to count primitive-level work:
+  - `n_estimator_calls`: number of `estimator.run(...)` calls
+  - `n_circuits_executed`: total pubs submitted across those calls (proxy for circuit executions)
+  - `n_pauli_terms_measured`: sum of non-identity Pauli terms across all submitted observables (proxy for measurement workload)
+- We also record coarse algorithm-level categories:
+  - `n_energy_evals`: objective-category energy evaluations (VQE objective calls; ADAPT energy evals of the current ansatz)
+  - `n_grad_evals`: gradient-category energy evaluations (ADAPT pool probes + parameter-shift energies; typically 0 for COBYLA VQE)
+
+Where it shows up:
+
+- Regular VQE histories: `runs/compare_vqe/logs_*/history.jsonl` now include the above counters on each callback line.
+- ADAPT histories: `runs/<run_id>_L*_Nup*_Ndown*/history.jsonl` include the counters each outer iteration.
+
+Plots:
+
+- `scripts/plot_cost_curves.py` generates best-so-far curves of `|ΔE|` versus a chosen x-axis cost proxy:
+  - default: `n_circuits_executed` (log-x)
+  - optional: `n_pauli_terms_measured`, `n_estimator_calls`, or `t_cum_s`
+
+Important note:
+
+- Old cached logs will not have these counters; to get cost curves under `runs/compare_vqe/`, re-run the benchmark after this instrumentation is present.
+
+## Correctness Beyond Energy (Variance, Fidelity, Observables, Leakage)
+
+Energy alone can be misleading (sector leakage, near-degeneracy, under-optimized circuits). We therefore compute additional state-quality metrics in statevector mode.
+
+Driver:
+
+- `scripts/benchmark_state_quality.py`
+
+Computed metrics per `(L, ansatz)` (when the run directory contains enough info to reconstruct the final state):
+
+- Energy variance: `Var(H) = <H^2> - <H>^2` (exact eigenstates have Var(H)=0).
+- Fidelity to the exact sector ground state: `1 - |<psi_exact|psi_ansatz>|^2`.
+- Physical observables (Hubbard-relevant):
+  - total double occupancy: `D = Σ_i <n_{i↑} n_{i↓}>`
+  - site densities: `<n_i>`
+  - nearest-neighbor spin correlations: `Σ_i <Sz_i Sz_{i+1}>`
+- Sector leakage: `p_leak = 1 - p_sector`, where `p_sector` is the probability mass in the target `(N,Sz)` sector.
+
+Outputs:
+
+- `runs/compare_vqe/state_quality_summary.md` and the associated plots under `runs/compare_vqe/`.
+- ADAPT trajectory summaries for `VarN/VarSz` are written to `runs/compare_vqe/leakage_traj.json` and plotted as `runs/compare_vqe/leakage_vs_depth_L*.png`.
+
+Prerequisites / caveats:
+
+- `benchmark_state_quality.py` expects `compare_rows.json` to include sector fields (`n_up`, `n_down`, `N`, `Sz`).
+- It also expects each cached run directory to contain a `result.json` with the final parameters (regular VQE logs store `optimal_point`; ADAPT runs store `theta` + chosen operator names). Old cached runs may lack these files and will be skipped with a `state_quality_error`.
+
+Microbenchmark for grouped-generator implementation error:
+
+- `scripts/benchmark_grouped_generator_approx.py` compares the exact sum-form evolution `exp(-i (theta/2) Σ c_j P_j)` against the product-form implementation `Π exp(-i (theta/2) c_j P_j)` (and a symmetric 2nd-order option).
+- It reports a distance proxy and induced sector leakage per selected operator, helping isolate whether leakage is coming from the implementation (product-form) rather than the mathematical generator (sum-form).
 
 ## How Circuit Metrics (Depth / CX) Were Computed
 
@@ -107,7 +186,7 @@ Key idea:
 
 Steps:
 
-- Infer which symmetry sector to use by inspecting cached ADAPT runs under `runs/` (read `meta.json` for the newest matching `(L, pool)` run).
+- Use the same per-L half-filling sector policy as the energy benchmark (do not infer sectors from unrelated cached runs).
 - For ADAPT CSE and ADAPT UCCSD:
   - Find cached run dirs under `runs/` for `pool="cse_density_ops"` and `pool="uccsd_excitations"`.
   - Parse the chosen operator names from `history.jsonl` (`chosen_op` entries).
@@ -131,11 +210,11 @@ Outputs:
 - `runs/compare_vqe/circuit_metrics.json` with raw + transpiled metrics per `(L, ansatz)`.
 - `runs/compare_vqe/circuit_metrics_depth.png` (bar chart of transpiled depth by `L` and ansatz).
 
-## Results: Energy Accuracy
+## Results: Energy Accuracy (Legacy Cached Numbers)
 
-Source: `runs/compare_vqe/compare_rows.json`
+Source: `runs/compare_vqe/compare_rows.json` (as cached at the time this table was generated).
 
-Energy results for the cached benchmark (sector is fixed to `(n_up,n_down)=(1,1)` for all L):
+These numbers were from a cached benchmark where the sector was fixed to `(n_up,n_down)=(1,1)` for all L (constant `N=2`). Treat this as **legacy/non-half-filling** for `L>2`.
 
 | L | Ansatz | Energy | Exact (sector) | dE = E - Exact | abs(dE) | rel = abs(dE)/abs(Exact) |
 |---:|---|---:|---:|---:|---:|---:|

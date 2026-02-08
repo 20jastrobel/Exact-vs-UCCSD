@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 import numpy as np
 from scipy.optimize import minimize
@@ -17,6 +18,7 @@ from qiskit_nature.second_q.mappers import JordanWignerMapper
 
 from .meta_lstm_optimizer import CoordinateWiseLSTMOptimizer, LSTMState
 from .meta_lstm import preprocess_gradients_torch
+from .cost_model import CostCounters
 from ..symmetry import commutes, map_symmetry_ops_to_qubits
 
 GROUPED_POOL_MODES = {"cse_density_ops", "uccsd_excitations"}
@@ -28,6 +30,13 @@ class MetaAdaptVQEResult:
     params: list[float]
     operators: list
     diagnostics: dict
+
+
+class BudgetExceeded(RuntimeError):
+    def __init__(self, reason: str, last_energy: float | None = None):
+        self.reason = reason
+        self.last_energy = last_energy
+        super().__init__(f"Budget exceeded: {reason}")
 
 
 def _canonicalize_to_hermitian(op: SparsePauliOp, *, atol: float) -> SparsePauliOp:
@@ -464,6 +473,7 @@ def _compute_grouped_pool_gradients(
     pool_specs: Sequence[dict],
     *,
     probe_convention: str,
+    energy_eval=None,
 ) -> list[float]:
     shift, coeff = _probe_shift_and_coeff(probe_convention)
     label_set: set[str] = set()
@@ -475,8 +485,12 @@ def _compute_grouped_pool_gradients(
     for label in sorted(label_set):
         probe_plus = _append_probe_gate(circuit, label, angle=shift)
         probe_minus = _append_probe_gate(circuit, label, angle=-shift)
-        e_plus = estimate_energy(estimator, probe_plus, qubit_op, theta)
-        e_minus = estimate_energy(estimator, probe_minus, qubit_op, theta)
+        if energy_eval is None:
+            e_plus = estimate_energy(estimator, probe_plus, qubit_op, theta)
+            e_minus = estimate_energy(estimator, probe_minus, qubit_op, theta)
+        else:
+            e_plus = energy_eval(probe_plus, theta)
+            e_minus = energy_eval(probe_minus, theta)
         g_cache[label] = coeff * (e_plus - e_minus)
 
     gradients: list[float] = []
@@ -716,10 +730,41 @@ def run_meta_adapt_vqe(
     polish_steps: int = 3,
     meta_alpha0: float = 1.0,
     meta_alpha_k: float = 0.0,
+    max_estimator_calls: int | None = None,
+    max_circuits_executed: int | None = None,
+    max_pauli_terms_measured: int | None = None,
+    max_time_s: float | None = None,
+    inner_steps_schedule: Callable[[int], int] | None = None,
+    cost_counters: CostCounters | None = None,
+    compute_var_h: bool = False,
+    var_h_simplify_atol: float = 1e-12,
     logger=None,
     log_every: int = 1,
     verbose: bool = True,
 ) -> MetaAdaptVQEResult:
+    t0 = time.perf_counter()
+    stop_reason: str | None = None
+
+    def _budget_reason() -> str | None:
+        # time budget
+        if max_time_s is not None and (time.perf_counter() - t0) >= float(max_time_s):
+            return "max_time_s"
+        if cost_counters is None:
+            return None
+        # primitive budgets (note: use >= so “exactly at limit” stops)
+        if max_estimator_calls is not None and cost_counters.n_estimator_calls >= int(max_estimator_calls):
+            return "max_estimator_calls"
+        if max_circuits_executed is not None and cost_counters.n_circuits_executed >= int(max_circuits_executed):
+            return "max_circuits_executed"
+        if max_pauli_terms_measured is not None and cost_counters.n_pauli_terms_measured >= int(max_pauli_terms_measured):
+            return "max_pauli_terms_measured"
+        return None
+
+    def _raise_if_over_budget(last_energy: float | None = None) -> None:
+        reason = _budget_reason()
+        if reason is not None:
+            raise BudgetExceeded(reason, last_energy=last_energy)
+
     pool_specs: list[dict] | None = None
     pool_labels: list[str] | None = None
     n_q = None
@@ -789,10 +834,40 @@ def run_meta_adapt_vqe(
     if lstm_optimizer is None:
         lstm_optimizer = CoordinateWiseLSTMOptimizer(seed=seed)
 
+    if cost_counters is None and hasattr(estimator, "counters"):
+        maybe = getattr(estimator, "counters", None)
+        if isinstance(maybe, CostCounters):
+            cost_counters = maybe
+
+    h2_op = None
+    if compute_var_h:
+        # For small-L statevector benchmarks this is cheap enough and gives a
+        # strong correctness signal (Var(H)=0 for exact eigenstates).
+        h2_op = (qubit_op @ qubit_op).simplify(atol=var_h_simplify_atol)
+
     rng = np.random.default_rng(seed)
     ops: list = []
     theta = np.zeros((0,), dtype=float)
-    energy_current = estimate_energy(estimator, reference_state, qubit_op, [])
+
+    def _energy_obj(circuit: QuantumCircuit, values: Sequence[float]) -> float:
+        if cost_counters is not None:
+            cost_counters.n_energy_evals += 1
+        e = estimate_energy(estimator, circuit, qubit_op, list(values))
+        _raise_if_over_budget(last_energy=e)
+        return e
+
+    def _energy_grad(circuit: QuantumCircuit, values: Sequence[float]) -> float:
+        if cost_counters is not None:
+            cost_counters.n_grad_evals += 1
+        e = estimate_energy(estimator, circuit, qubit_op, list(values))
+        _raise_if_over_budget(last_energy=e)
+        return e
+
+    try:
+        energy_current = _energy_obj(reference_state, [])
+    except BudgetExceeded as exc:
+        energy_current = float(exc.last_energy) if exc.last_energy is not None else float("nan")
+        stop_reason = f"budget:{exc.reason}"
     prev_energy: float | None = None
 
     lstm_state = lstm_optimizer.init_state(0)
@@ -807,7 +882,7 @@ def run_meta_adapt_vqe(
 
     if logger is not None:
         sector_extra = None
-        if mapper is not None and n_sites is not None and n_up is not None and n_down is not None:
+        if stop_reason is None and mapper is not None and n_sites is not None and n_up is not None and n_down is not None:
             sector_extra = compute_sector_diagnostics(
                 estimator=estimator,
                 circuit=reference_state,
@@ -817,6 +892,10 @@ def run_meta_adapt_vqe(
                 n_target=int(n_up) + int(n_down),
                 sz_target=0.5 * (int(n_up) - int(n_down)),
             )
+        var_h_extra = None
+        if stop_reason is None and h2_op is not None:
+            e2 = estimate_expectation(estimator, reference_state, h2_op, [])
+            var_h_extra = {"VarH": float(max(0.0, e2 - energy_current * energy_current))}
         logger.log_point(
             it=0,
             energy=energy_current,
@@ -828,299 +907,372 @@ def run_meta_adapt_vqe(
                 "ansatz_len": 0,
                 "n_params": 0,
                 "pool_size": len(pool_specs) if pool_specs is not None else len(pool_labels),
+                "stop_reason": stop_reason,
+                **(cost_counters.snapshot() if cost_counters is not None else {}),
+                **(var_h_extra or {}),
                 **(sector_extra or {}),
             },
+        )
+
+    if stop_reason is not None:
+        diagnostics["stop_reason"] = stop_reason
+        diagnostics["t_total_s"] = float(time.perf_counter() - t0)
+        return MetaAdaptVQEResult(
+            energy=energy_current,
+            params=[],
+            operators=[],
+            diagnostics=diagnostics,
         )
 
     for outer_idx in range(max_depth):
         if logger is not None:
             logger.start_iter()
-        if pool_mode in GROUPED_POOL_MODES and not pool_specs:
-            if verbose:
-                print("ADAPT stop: operator pool exhausted.")
-            break
-        if pool_mode not in GROUPED_POOL_MODES and not pool_labels:
-            if verbose:
-                print("ADAPT stop: operator pool exhausted.")
-            break
-        if pool_mode in GROUPED_POOL_MODES:
-            circuit, _params = build_adapt_circuit_grouped(reference_state, ops)
-        else:
-            circuit, _params = build_adapt_circuit(reference_state, ops)
-
-        def energy_fn(values: Iterable[float]) -> float:
-            return estimate_energy(estimator, circuit, qubit_op, list(values))
-
-        if pool_mode in GROUPED_POOL_MODES:
-            pool_gradients = _compute_grouped_pool_gradients(
-                estimator,
-                circuit,
-                qubit_op,
-                theta,
-                pool_specs,
-                probe_convention=probe_convention,
-            )
-            max_idx = int(np.argmax(np.abs(pool_gradients)))
-            max_abs_grad = float(abs(pool_gradients[max_idx]))
-        else:
-            pool_gradients = []
-            max_abs_grad = -1.0
-            max_idx = 0
-            for idx, label in enumerate(pool_labels):
-                probe_plus = _append_probe_gate(circuit, label, angle=shift)
-                probe_minus = _append_probe_gate(circuit, label, angle=-shift)
-                e_plus = estimate_energy(estimator, probe_plus, qubit_op, theta)
-                e_minus = estimate_energy(estimator, probe_minus, qubit_op, theta)
-                grad_val = coeff * (e_plus - e_minus)
-                pool_gradients.append(grad_val)
-                if abs(grad_val) > max_abs_grad:
-                    max_abs_grad = abs(grad_val)
-                    max_idx = idx
-
-        if prev_energy is not None and abs(energy_current - prev_energy) < eps_energy:
-            if verbose:
-                print(
-                    f"ADAPT stop: |ΔE|={abs(energy_current - prev_energy):.3e} < {eps_energy}"
-                )
-            if logger is not None:
-                dt, tc = logger.end_iter()
-                if (outer_idx + 1) % max(1, log_every) == 0:
-                    logger.log_point(
-                        it=outer_idx + 1,
-                        energy=energy_current,
-                        max_grad=max_abs_grad,
-                        chosen_op=None,
-                        t_iter_s=dt,
-                        t_cum_s=tc,
-                        extra={
-                            "ansatz_len": len(ops),
-                            "n_params": len(theta),
-                            "pool_size": len(pool_specs) if pool_specs is not None else len(pool_labels),
-                        },
-                    )
-            break
-        if max_abs_grad < eps_grad:
-            if verbose:
-                print(f"ADAPT stop: max|g|={max_abs_grad:.3e} < {eps_grad}")
-            if logger is not None:
-                dt, tc = logger.end_iter()
-                if (outer_idx + 1) % max(1, log_every) == 0:
-                    logger.log_point(
-                        it=outer_idx + 1,
-                        energy=energy_current,
-                        max_grad=max_abs_grad,
-                        chosen_op=None,
-                        t_iter_s=dt,
-                        t_cum_s=tc,
-                        extra={
-                            "ansatz_len": len(ops),
-                            "n_params": len(theta),
-                            "pool_size": len(pool_specs) if pool_specs is not None else len(pool_labels),
-                        },
-                    )
-            break
-
-        if pool_mode in GROUPED_POOL_MODES:
-            chosen_spec = pool_specs[max_idx]
-            ops.append(chosen_spec)
-            chosen_op = chosen_spec["name"]
-            if not allow_repeats:
-                pool_specs.pop(max_idx)
-        else:
-            chosen_op = pool_labels[max_idx]
-            ops.append(chosen_op)
-            if not allow_repeats:
-                pool_labels.pop(max_idx)
-        if verbose:
-            print(
-                f"ADAPT iter {len(ops)}: op={chosen_op}, max|g|={max_abs_grad:.6e}"
-            )
+        try:
+            if pool_mode in GROUPED_POOL_MODES and not pool_specs:
+                if verbose:
+                    print("ADAPT stop: operator pool exhausted.")
+                stop_reason = "pool_exhausted"
+                break
+            if pool_mode not in GROUPED_POOL_MODES and not pool_labels:
+                if verbose:
+                    print("ADAPT stop: operator pool exhausted.")
+                stop_reason = "pool_exhausted"
+                break
             if pool_mode in GROUPED_POOL_MODES:
-                comp_preview = ", ".join(
-                    f"{lbl}:{wt:.3f}" for lbl, wt in chosen_spec["paulis"][:6]
+                circuit, _params = build_adapt_circuit_grouped(reference_state, ops)
+            else:
+                circuit, _params = build_adapt_circuit(reference_state, ops)
+
+            if pool_mode in GROUPED_POOL_MODES:
+                pool_gradients = _compute_grouped_pool_gradients(
+                    estimator,
+                    circuit,
+                    qubit_op,
+                    theta,
+                    pool_specs,
+                    probe_convention=probe_convention,
+                    energy_eval=_energy_grad,
                 )
-                if len(chosen_spec["paulis"]) > 6:
-                    comp_preview += ", ..."
-                print(f"  components: {comp_preview}")
+                max_idx = int(np.argmax(np.abs(pool_gradients)))
+                max_abs_grad = float(abs(pool_gradients[max_idx]))
+            else:
+                pool_gradients = []
+                max_abs_grad = -1.0
+                max_idx = 0
+                for idx, label in enumerate(pool_labels):
+                    probe_plus = _append_probe_gate(circuit, label, angle=shift)
+                    probe_minus = _append_probe_gate(circuit, label, angle=-shift)
+                    e_plus = _energy_grad(probe_plus, theta)
+                    e_minus = _energy_grad(probe_minus, theta)
+                    grad_val = coeff * (e_plus - e_minus)
+                    pool_gradients.append(grad_val)
+                    if abs(grad_val) > max_abs_grad:
+                        max_abs_grad = abs(grad_val)
+                        max_idx = idx
 
-        theta = np.concatenate([theta, [0.0]])
-        if theta_init_noise > 0.0:
-            theta[-1] = rng.normal(scale=theta_init_noise)
-        if reuse_lstm_state:
-            h = np.vstack([lstm_state.h, np.zeros((1, lstm_optimizer.hidden_size))])
-            c = np.vstack([lstm_state.c, np.zeros((1, lstm_optimizer.hidden_size))])
-            lstm_state = LSTMState(h=h, c=c)
-        else:
-            lstm_state = lstm_optimizer.init_state(len(theta))
+            if prev_energy is not None and abs(energy_current - prev_energy) < eps_energy:
+                if verbose:
+                    print(
+                        f"ADAPT stop: |ΔE|={abs(energy_current - prev_energy):.3e} < {eps_energy}"
+                    )
+                stop_reason = "eps_energy"
+                if logger is not None:
+                    dt, tc = logger.end_iter()
+                    if (outer_idx + 1) % max(1, log_every) == 0:
+                        var_h_extra = None
+                        if h2_op is not None:
+                            e2 = estimate_expectation(estimator, circuit, h2_op, theta)
+                            var_h_extra = {"VarH": float(max(0.0, e2 - energy_current * energy_current))}
+                        logger.log_point(
+                            it=outer_idx + 1,
+                            energy=energy_current,
+                            max_grad=max_abs_grad,
+                            chosen_op=None,
+                            t_iter_s=dt,
+                            t_cum_s=tc,
+                            extra={
+                                "ansatz_len": len(ops),
+                                "n_params": len(theta),
+                                "pool_size": len(pool_specs) if pool_specs is not None else len(pool_labels),
+                                "stop_reason": stop_reason,
+                                **(cost_counters.snapshot() if cost_counters is not None else {}),
+                                **(var_h_extra or {}),
+                            },
+                        )
+                break
+            if max_abs_grad < eps_grad:
+                if verbose:
+                    print(f"ADAPT stop: max|g|={max_abs_grad:.3e} < {eps_grad}")
+                stop_reason = "eps_grad"
+                if logger is not None:
+                    dt, tc = logger.end_iter()
+                    if (outer_idx + 1) % max(1, log_every) == 0:
+                        var_h_extra = None
+                        if h2_op is not None:
+                            e2 = estimate_expectation(estimator, circuit, h2_op, theta)
+                            var_h_extra = {"VarH": float(max(0.0, e2 - energy_current * energy_current))}
+                        logger.log_point(
+                            it=outer_idx + 1,
+                            energy=energy_current,
+                            max_grad=max_abs_grad,
+                            chosen_op=None,
+                            t_iter_s=dt,
+                            t_cum_s=tc,
+                            extra={
+                                "ansatz_len": len(ops),
+                                "n_params": len(theta),
+                                "pool_size": len(pool_specs) if pool_specs is not None else len(pool_labels),
+                                "stop_reason": stop_reason,
+                                **(cost_counters.snapshot() if cost_counters is not None else {}),
+                                **(var_h_extra or {}),
+                            },
+                        )
+                break
 
-        if pool_mode in GROUPED_POOL_MODES:
-            circuit, _params = build_adapt_circuit_grouped(reference_state, ops)
-        else:
-            circuit, _params = build_adapt_circuit(reference_state, ops)
-
-        def energy_fn(values: Iterable[float]) -> float:
-            return estimate_energy(estimator, circuit, qubit_op, list(values))
-
-        def grad_fn(values: Iterable[float]) -> np.ndarray:
-            return parameter_shift_grad(energy_fn, np.asarray(values, dtype=float))
-
-        inner_stats: dict | None = None
-        if inner_optimizer == "meta":
-            if meta_model is None:
-                raise RuntimeError("Meta optimizer requested without a loaded model.")
-            theta, inner_stats = _meta_optimize(
-                theta,
-                energy_fn,
-                grad_fn,
-                steps=inner_steps,
-                model=meta_model,
-                r=r,
-                step_scale=meta_step_scale,
-                dtheta_clip=meta_dtheta_clip,
-                alpha0=meta_alpha0,
-                alpha_k=meta_alpha_k,
-                verbose=verbose,
-            )
-        elif inner_optimizer == "lbfgs":
-            theta, inner_stats = _lbfgs_optimize(
-                theta,
-                energy_fn,
-                grad_fn,
-                theta_bound=theta_bound,
-                maxiter=lbfgs_maxiter,
-                restarts=lbfgs_restarts,
-                rng=rng,
-            )
-        elif inner_optimizer == "hybrid":
-            warm_steps = max(0, min(inner_steps, warmup_steps))
-            meta_steps = max(0, inner_steps - warm_steps)
-
-            theta_warm, warm_stats = _lbfgs_optimize(
-                theta,
-                energy_fn,
-                grad_fn,
-                theta_bound=theta_bound,
-                maxiter=warm_steps if warm_steps > 0 else None,
-                restarts=1,
-                rng=rng,
-            )
-            if verbose and warm_steps > 0:
-                e_warm = energy_fn(theta_warm)
-                g_warm = grad_fn(theta_warm)
+            if pool_mode in GROUPED_POOL_MODES:
+                chosen_spec = pool_specs[max_idx]
+                ops.append(chosen_spec)
+                chosen_op = chosen_spec["name"]
+                if not allow_repeats:
+                    pool_specs.pop(max_idx)
+            else:
+                chosen_op = pool_labels[max_idx]
+                ops.append(chosen_op)
+                if not allow_repeats:
+                    pool_labels.pop(max_idx)
+            if verbose:
                 print(
-                    f"  warm-start: E={e_warm:.10f}, ||g||={np.linalg.norm(g_warm):.3e}, "
-                    f"max|g|={np.max(np.abs(g_warm)):.3e}"
+                    f"ADAPT iter {len(ops)}: op={chosen_op}, max|g|={max_abs_grad:.6e}"
+                )
+                if pool_mode in GROUPED_POOL_MODES:
+                    comp_preview = ", ".join(
+                        f"{lbl}:{wt:.3f}" for lbl, wt in chosen_spec["paulis"][:6]
+                    )
+                    if len(chosen_spec["paulis"]) > 6:
+                        comp_preview += ", ..."
+                    print(f"  components: {comp_preview}")
+
+            theta = np.concatenate([theta, [0.0]])
+            if theta_init_noise > 0.0:
+                theta[-1] = rng.normal(scale=theta_init_noise)
+            if reuse_lstm_state:
+                h = np.vstack([lstm_state.h, np.zeros((1, lstm_optimizer.hidden_size))])
+                c = np.vstack([lstm_state.c, np.zeros((1, lstm_optimizer.hidden_size))])
+                lstm_state = LSTMState(h=h, c=c)
+            else:
+                lstm_state = lstm_optimizer.init_state(len(theta))
+
+            if pool_mode in GROUPED_POOL_MODES:
+                circuit, _params = build_adapt_circuit_grouped(reference_state, ops)
+            else:
+                circuit, _params = build_adapt_circuit(reference_state, ops)
+
+            def energy_fn(values: Iterable[float]) -> float:
+                return _energy_obj(circuit, list(values))
+
+            def energy_fn_grad(values: Iterable[float]) -> float:
+                return _energy_grad(circuit, list(values))
+
+            def grad_fn(values: Iterable[float]) -> np.ndarray:
+                return parameter_shift_grad(energy_fn_grad, np.asarray(values, dtype=float))
+
+            steps_this_iter = int(inner_steps)
+            if inner_steps_schedule is not None:
+                steps_this_iter = int(inner_steps_schedule(len(theta)))
+            steps_this_iter = max(0, steps_this_iter)
+
+            inner_stats: dict | None = None
+            if inner_optimizer == "meta":
+                if meta_model is None:
+                    raise RuntimeError("Meta optimizer requested without a loaded model.")
+                theta, inner_stats = _meta_optimize(
+                    theta,
+                    energy_fn,
+                    grad_fn,
+                    steps=steps_this_iter,
+                    model=meta_model,
+                    r=r,
+                    step_scale=meta_step_scale,
+                    dtheta_clip=meta_dtheta_clip,
+                    alpha0=meta_alpha0,
+                    alpha_k=meta_alpha_k,
+                    verbose=verbose,
+                )
+            elif inner_optimizer == "lbfgs":
+                theta, inner_stats = _lbfgs_optimize(
+                    theta,
+                    energy_fn,
+                    grad_fn,
+                    theta_bound=theta_bound,
+                    maxiter=steps_this_iter if steps_this_iter > 0 else None,
+                    restarts=lbfgs_restarts,
+                    rng=rng,
+                )
+            elif inner_optimizer == "hybrid":
+                warm_steps = max(0, min(steps_this_iter, warmup_steps))
+                meta_steps = max(0, steps_this_iter - warm_steps)
+
+                theta_warm, warm_stats = _lbfgs_optimize(
+                    theta,
+                    energy_fn,
+                    grad_fn,
+                    theta_bound=theta_bound,
+                    maxiter=warm_steps if warm_steps > 0 else None,
+                    restarts=1,
+                    rng=rng,
+                )
+                if verbose and warm_steps > 0:
+                    e_warm = energy_fn(theta_warm)
+                    g_warm = grad_fn(theta_warm)
+                    print(
+                        f"  warm-start: E={e_warm:.10f}, ||g||={np.linalg.norm(g_warm):.3e}, "
+                        f"max|g|={np.max(np.abs(g_warm)):.3e}"
+                    )
+
+                theta_meta = theta_warm.copy()
+                delta_norms = []
+                if meta_steps > 0:
+                    if meta_model is not None:
+                        torch = _maybe_import_torch()
+                        device = next(meta_model.parameters()).device
+                        meta_model.eval()
+                        n_params = theta_meta.size
+                        h = torch.zeros((n_params, meta_model.hidden_size), device=device)
+                        c = torch.zeros((n_params, meta_model.hidden_size), device=device)
+
+                        for step_idx in range(meta_steps):
+                            grad = grad_fn(theta_meta)
+                            x = preprocess_gradients_torch(grad, r=r, device=device)
+                            with torch.no_grad():
+                                delta, (h, c) = meta_model(x, (h, c))
+                            delta = delta.cpu().numpy().astype(float)
+                            if meta_dtheta_clip is not None:
+                                delta = np.clip(delta, -meta_dtheta_clip, meta_dtheta_clip)
+                            alpha = meta_alpha0 * (1.0 + meta_alpha_k * (step_idx / max(1, meta_steps - 1)))
+                            delta = alpha * delta
+                            theta_meta = theta_meta + delta
+                            delta_norms.append(float(np.linalg.norm(delta)))
+                    else:
+                        for step_idx in range(meta_steps):
+                            grad = grad_fn(theta_meta)
+                            delta = -grad
+                            if meta_dtheta_clip is not None:
+                                delta = np.clip(delta, -meta_dtheta_clip, meta_dtheta_clip)
+                            alpha = meta_alpha0 * (1.0 + meta_alpha_k * (step_idx / max(1, meta_steps - 1)))
+                            delta = alpha * delta
+                            theta_meta = theta_meta + delta
+                            delta_norms.append(float(np.linalg.norm(delta)))
+
+                meta_stats = {"avg_delta_norm": float(np.mean(delta_norms)) if delta_norms else 0.0}
+
+                theta_polish, polish_stats = _lbfgs_optimize(
+                    theta_meta,
+                    energy_fn,
+                    grad_fn,
+                    theta_bound=theta_bound,
+                    maxiter=polish_steps if polish_steps > 0 else None,
+                    restarts=1,
+                    rng=rng,
+                )
+                if verbose and polish_steps > 0:
+                    e_polish = energy_fn(theta_polish)
+                    g_polish = grad_fn(theta_polish)
+                    print(
+                        f"  polish: E={e_polish:.10f}, ||g||={np.linalg.norm(g_polish):.3e}, "
+                        f"max|g|={np.max(np.abs(g_polish)):.3e}"
+                    )
+                theta = theta_polish
+                inner_stats = {
+                    "warm": warm_stats,
+                    "meta": meta_stats,
+                    "polish": polish_stats,
+                }
+            else:
+                raise ValueError(f"Unknown inner optimizer: {inner_optimizer}")
+
+            if wrap_angles:
+                theta = _wrap_angles(theta)
+
+            prev_energy = energy_current
+            energy_current = energy_fn(theta)
+
+            sector_diag = None
+            if mapper is not None and n_sites is not None and n_up is not None and n_down is not None:
+                sector_diag = compute_sector_diagnostics(
+                    estimator=estimator,
+                    circuit=circuit,
+                    params=theta,
+                    mapper=mapper,
+                    n_sites=int(n_sites),
+                    n_target=int(n_up) + int(n_down),
+                    sz_target=0.5 * (int(n_up) - int(n_down)),
                 )
 
-            theta_meta = theta_warm.copy()
-            delta_norms = []
-            if meta_steps > 0:
-                if meta_model is not None:
-                    torch = _maybe_import_torch()
-                    device = next(meta_model.parameters()).device
-                    meta_model.eval()
-                    n_params = theta_meta.size
-                    h = torch.zeros((n_params, meta_model.hidden_size), device=device)
-                    c = torch.zeros((n_params, meta_model.hidden_size), device=device)
+            var_h_diag = None
+            if h2_op is not None:
+                e2 = estimate_expectation(estimator, circuit, h2_op, theta)
+                var_h_diag = float(max(0.0, e2 - energy_current * energy_current))
 
-                    for step_idx in range(meta_steps):
-                        grad = grad_fn(theta_meta)
-                        x = preprocess_gradients_torch(grad, r=r, device=device)
-                        with torch.no_grad():
-                            delta, (h, c) = meta_model(x, (h, c))
-                        delta = delta.cpu().numpy().astype(float)
-                        if meta_dtheta_clip is not None:
-                            delta = np.clip(delta, -meta_dtheta_clip, meta_dtheta_clip)
-                        alpha = meta_alpha0 * (1.0 + meta_alpha_k * (step_idx / max(1, meta_steps - 1)))
-                        delta = alpha * delta
-                        theta_meta = theta_meta + delta
-                        delta_norms.append(float(np.linalg.norm(delta)))
-                else:
-                    for step_idx in range(meta_steps):
-                        grad = grad_fn(theta_meta)
-                        delta = -grad
-                        if meta_dtheta_clip is not None:
-                            delta = np.clip(delta, -meta_dtheta_clip, meta_dtheta_clip)
-                        alpha = meta_alpha0 * (1.0 + meta_alpha_k * (step_idx / max(1, meta_steps - 1)))
-                        delta = alpha * delta
-                        theta_meta = theta_meta + delta
-                        delta_norms.append(float(np.linalg.norm(delta)))
-
-            meta_stats = {"avg_delta_norm": float(np.mean(delta_norms)) if delta_norms else 0.0}
-
-            theta_polish, polish_stats = _lbfgs_optimize(
-                theta_meta,
-                energy_fn,
-                grad_fn,
-                theta_bound=theta_bound,
-                maxiter=polish_steps if polish_steps > 0 else None,
-                restarts=1,
-                rng=rng,
+            if logger is not None:
+                dt, tc = logger.end_iter()
+                if (outer_idx + 1) % max(1, log_every) == 0:
+                    logger.log_point(
+                        it=outer_idx + 1,
+                        energy=energy_current,
+                        max_grad=max_abs_grad,
+                        chosen_op=chosen_op,
+                        t_iter_s=dt,
+                        t_cum_s=tc,
+                        extra={
+                            "ansatz_len": len(ops),
+                            "n_params": len(theta),
+                            "pool_size": len(pool_specs) if pool_specs is not None else len(pool_labels),
+                            "stop_reason": stop_reason,
+                            **(cost_counters.snapshot() if cost_counters is not None else {}),
+                            **({"VarH": float(var_h_diag)} if var_h_diag is not None else {}),
+                            **(sector_diag or {}),
+                        },
+                    )
+            diagnostics["outer"].append(
+                {
+                    "outer_iter": len(ops),
+                    "chosen_op": chosen_op,
+                    "chosen_components": chosen_spec["paulis"] if pool_mode in GROUPED_POOL_MODES else None,
+                    "max_grad": max_abs_grad,
+                    "energy": energy_current,
+                    "VarH": var_h_diag,
+                    "pool_gradients": pool_gradients,
+                    "inner_stats": inner_stats,
+                    "inner_optimizer": inner_optimizer,
+                    "sector": sector_diag,
+                }
             )
-            if verbose and polish_steps > 0:
-                e_polish = energy_fn(theta_polish)
-                g_polish = grad_fn(theta_polish)
-                print(
-                    f"  polish: E={e_polish:.10f}, ||g||={np.linalg.norm(g_polish):.3e}, "
-                    f"max|g|={np.max(np.abs(g_polish)):.3e}"
-                )
-            theta = theta_polish
-            inner_stats = {
-                "warm": warm_stats,
-                "meta": meta_stats,
-                "polish": polish_stats,
-            }
-        else:
-            raise ValueError(f"Unknown inner optimizer: {inner_optimizer}")
+        except BudgetExceeded as exc:
+            stop_reason = f"budget:{exc.reason}"
+            if exc.last_energy is not None:
+                energy_current = float(exc.last_energy)
+            if logger is not None:
+                dt, tc = logger.end_iter()
+                if (outer_idx + 1) % max(1, log_every) == 0:
+                    logger.log_point(
+                        it=outer_idx + 1,
+                        energy=energy_current,
+                        max_grad=None,
+                        chosen_op=None,
+                        t_iter_s=dt,
+                        t_cum_s=tc,
+                        extra={
+                            "ansatz_len": len(ops),
+                            "n_params": len(theta),
+                            "pool_size": len(pool_specs) if pool_specs is not None else len(pool_labels),
+                            "stop_reason": stop_reason,
+                            **(cost_counters.snapshot() if cost_counters is not None else {}),
+                        },
+                    )
+            break
 
-        if wrap_angles:
-            theta = _wrap_angles(theta)
-
-        prev_energy = energy_current
-        energy_current = energy_fn(theta)
-
-        sector_diag = None
-        if mapper is not None and n_sites is not None and n_up is not None and n_down is not None:
-            sector_diag = compute_sector_diagnostics(
-                estimator=estimator,
-                circuit=circuit,
-                params=theta,
-                mapper=mapper,
-                n_sites=int(n_sites),
-                n_target=int(n_up) + int(n_down),
-                sz_target=0.5 * (int(n_up) - int(n_down)),
-            )
-
-        if logger is not None:
-            dt, tc = logger.end_iter()
-            if (outer_idx + 1) % max(1, log_every) == 0:
-                logger.log_point(
-                    it=outer_idx + 1,
-                    energy=energy_current,
-                    max_grad=max_abs_grad,
-                    chosen_op=chosen_op,
-                    t_iter_s=dt,
-                    t_cum_s=tc,
-                    extra={
-                        "ansatz_len": len(ops),
-                        "n_params": len(theta),
-                        "pool_size": len(pool_specs) if pool_specs is not None else len(pool_labels),
-                        **(sector_diag or {}),
-                    },
-                )
-        diagnostics["outer"].append(
-            {
-                "outer_iter": len(ops),
-                "chosen_op": chosen_op,
-                "chosen_components": chosen_spec["paulis"] if pool_mode in GROUPED_POOL_MODES else None,
-                "max_grad": max_abs_grad,
-                "energy": energy_current,
-                "pool_gradients": pool_gradients,
-                "inner_stats": inner_stats,
-                "inner_optimizer": inner_optimizer,
-                "sector": sector_diag,
-            }
-        )
+    diagnostics["stop_reason"] = stop_reason
+    diagnostics["t_total_s"] = float(time.perf_counter() - t0)
 
     return MetaAdaptVQEResult(
         energy=energy_current,
