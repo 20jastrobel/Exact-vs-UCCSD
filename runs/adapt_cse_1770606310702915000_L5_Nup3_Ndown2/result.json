@@ -1,0 +1,33 @@
+{
+  "artifacts": [],
+  "best_energy": 2.4048019067741153,
+  "budget": {
+    "budget_k": 2000.0,
+    "max_circuits_executed": null,
+    "max_pauli_terms_measured": 50000,
+    "max_time_s": null
+  },
+  "energy": 3.6700051514119645,
+  "exact_energy": -2.4174730048142195,
+  "n_down": 2,
+  "n_up": 3,
+  "operators": [
+    "gamma_im(+_6 -_7)",
+    "gamma_im(+_2 -_3)",
+    "gamma_im(+_5 -_6)",
+    "gamma_im(+_7 -_8)",
+    "gamma_im(+_1 -_2)"
+  ],
+  "pool": "cse_density_ops",
+  "run_id": "adapt_cse_1770606310702915000",
+  "sites": 5,
+  "status": "completed",
+  "stop_reason": "budget:max_pauli_terms_measured",
+  "theta": [
+    2.85774567882374,
+    2.61361497729615,
+    1.4413809880505024,
+    0.5056549197323177,
+    0.0
+  ]
+}
