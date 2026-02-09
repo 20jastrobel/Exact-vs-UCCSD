@@ -90,7 +90,10 @@ def find_adapt_run_dir(
             continue
         meta_path = run_dir / "meta.json"
         hist_path = run_dir / "history.jsonl"
-        if not meta_path.exists() or not hist_path.exists():
+        # Require result.json so we don't accidentally plot an interrupted run
+        # (which may contain only partial history rows).
+        result_path = run_dir / "result.json"
+        if not meta_path.exists() or not hist_path.exists() or not result_path.exists():
             continue
         try:
             meta = _load_json(meta_path)
@@ -225,4 +228,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -94,7 +94,10 @@ def find_adapt_run_dir(
             continue
         meta_path = run_dir / "meta.json"
         hist_path = run_dir / "history.jsonl"
-        if not meta_path.exists() or not hist_path.exists():
+        # Require result.json so we don't accidentally pick up interrupted runs
+        # (which may contain only partial history rows).
+        result_path = run_dir / "result.json"
+        if not meta_path.exists() or not hist_path.exists() or not result_path.exists():
             continue
         try:
             meta = _load_json(meta_path)
@@ -162,6 +165,7 @@ def main() -> None:
     args = ap.parse_args()
 
     sites = sorted(set(int(s) for s in args.sites))
+    sites_tag = "_".join(f"L{s}" for s in sites)
     compare_rows = _load_json(Path(args.compare))
     compare_dir = Path(args.compare_dir)
     runs_root = Path(args.runs_root)
@@ -288,7 +292,7 @@ def main() -> None:
         )
         axes[0].legend(ncol=2, fontsize=8)
         fig.tight_layout()
-        out_path = out_dir / "bench_circuit_metrics_L2_L3_L4.png"
+        out_path = out_dir / f"bench_circuit_metrics_{sites_tag}.png"
         fig.savefig(out_path, dpi=200)
         plt.close(fig)
         print(f"Saved: {out_path}")
@@ -325,7 +329,7 @@ def main() -> None:
     )
     axes[0, 0].legend(ncol=2, fontsize=8)
     fig.tight_layout()
-    out_path = out_dir / "bench_cost_metrics_L2_L3_L4.png"
+    out_path = out_dir / f"bench_cost_metrics_{sites_tag}.png"
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
     print(f"Saved: {out_path}")
@@ -348,7 +352,7 @@ def main() -> None:
     )
     axes[0].legend(ncol=2, fontsize=8)
     fig.tight_layout()
-    out_path = out_dir / "bench_budget_fractions_L2_L3_L4.png"
+    out_path = out_dir / f"bench_budget_fractions_{sites_tag}.png"
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
     print(f"Saved: {out_path}")
@@ -356,4 +360,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

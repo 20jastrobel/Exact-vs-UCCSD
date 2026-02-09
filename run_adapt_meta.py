@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
+import subprocess
 import sys
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Sequence
@@ -31,6 +34,13 @@ from pydephasing.quantum.vqe.cost_model import CostCounters, CountingEstimator
 from pydephasing.quantum.symmetry import (
     exact_ground_energy_sector,
     map_symmetry_ops_to_qubits,
+)
+from pydephasing.quantum.vqe.run_store import (
+    JsonRunStore,
+    MultiRunStore,
+    RunStoreLogger,
+    SqliteRunStore,
+    sha256_file,
 )
 from pydephasing.quantum.utils_particles import (
     half_filling_num_particles,
@@ -66,6 +76,23 @@ def _save_result(path: str, energy: float, params: Sequence[float], operators: S
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
+
+def _git_info() -> dict[str, object] | None:
+    """Best-effort git provenance (commit + dirty)."""
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+    except Exception:
+        return None
+    try:
+        dirty = subprocess.check_output(
+            ["git", "status", "--porcelain"], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        is_dirty = bool(dirty)
+    except Exception:
+        is_dirty = None
+    return {"git_commit": commit, "git_dirty": is_dirty}
 
 
 class RunLogger:
@@ -197,6 +224,19 @@ def main() -> None:
     parser.add_argument("--polish-steps", type=int, default=3)
     parser.add_argument("--logdir", type=str, default="runs")
     parser.add_argument("--run-id", type=str, default=None)
+    parser.add_argument(
+        "--store",
+        type=str,
+        choices=["sqlite", "json"],
+        default=os.environ.get("RUN_STORE", "sqlite"),
+        help="Run storage backend (env: RUN_STORE).",
+    )
+    parser.add_argument(
+        "--db",
+        type=str,
+        default=os.environ.get("RUNS_DB_PATH", "data/runs.db"),
+        help="SQLite DB path when --store sqlite (env: RUNS_DB_PATH).",
+    )
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--theta-init-noise", type=float, default=0.0)
     parser.add_argument("--lbfgs-restarts", type=int, default=3)
@@ -298,8 +338,17 @@ def main() -> None:
 
     reference_state = build_reference_state(qubit_op.num_qubits, occupations)
 
-    run_dir = make_run_dir_and_meta(args)
-    logger = RunLogger(run_dir)
+    # Resolve run_id early so both JSON and SQLite stores share the same identifier.
+    if args.run_id is None:
+        args.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = str(args.run_id)
+
+    exact_sector = exact_ground_energy_sector(
+        qubit_op,
+        args.sites,
+        args.n_up + args.n_down,
+        0.5 * (args.n_up - args.n_down),
+    )
 
     warned_missing_weights = False
     meta_model = None
@@ -353,8 +402,106 @@ def main() -> None:
         weights = _load_weights(args.weights)
     lstm = CoordinateWiseLSTMOptimizer(seed=args.seed, weights=weights) if weights else CoordinateWiseLSTMOptimizer(seed=args.seed)
 
+    git_info = _git_info() or {}
+    system_json = {
+        "sites": int(args.sites),
+        "n_up": int(args.n_up),
+        "n_down": int(args.n_down),
+        "n_total": int(args.n_up) + int(args.n_down),
+        "sz_target": 0.5 * (int(args.n_up) - int(args.n_down)),
+        "occupations": list(map(int, occupations)),
+        "ham_params": {"t": float(args.t), "u": float(args.u), "dv": float(args.dv)},
+    }
+    ansatz_json = {
+        "pool": str(args.pool),
+        "enforce_sector": bool(args.enforce_sector),
+        "cse": {
+            "include_diagonal": bool(args.cse_include_diagonal),
+            "include_antihermitian_part": bool(args.cse_include_antihermitian),
+            "include_hermitian_part": bool(args.cse_include_hermitian),
+        },
+        "uccsd": {
+            "reps": int(args.uccsd_reps),
+            "include_imaginary": bool(args.uccsd_include_imaginary),
+            "generalized": bool(args.uccsd_generalized),
+            "preserve_spin": bool(args.uccsd_preserve_spin),
+        },
+    }
+    optimizer_json = {
+        "inner_optimizer": str(args.inner_optimizer),
+        "max_depth": int(args.max_depth),
+        "inner_steps": int(args.inner_steps),
+        "warmup_steps": int(args.warmup_steps),
+        "polish_steps": int(args.polish_steps),
+        "eps_grad": float(args.eps_grad),
+        "eps_energy": float(args.eps_energy),
+        "theta_bound": str(args.theta_bound),
+        "lbfgs_restarts": int(args.lbfgs_restarts),
+        "meta": {
+            "meta_r": float(args.meta_r),
+            "meta_step_scale": float(args.meta_step_scale),
+            "meta_dtheta_clip": float(args.meta_dtheta_clip),
+            "meta_warmup_steps": int(args.meta_warmup_steps),
+            "meta_hidden": int(args.meta_hidden),
+            "meta_alpha0": float(args.meta_alpha0),
+            "meta_alpha_k": float(args.meta_alpha_k),
+        },
+    }
+
+    # RunStore config: keep legacy top-level keys for compatibility with scripts that
+    # discover runs by reading meta.json, but also include structured JSON blobs for
+    # DB queries (system/ansatz/optimizer).
+    run_config = {
+        "run_id": run_id,
+        "sites": int(args.sites),
+        "n_up": int(args.n_up),
+        "n_down": int(args.n_down),
+        "sz_target": float(args.sz_target),
+        "pool": str(args.pool),
+        "cse": dict(ansatz_json["cse"]),
+        "uccsd": dict(ansatz_json["uccsd"]),
+        "inner_optimizer": str(args.inner_optimizer),
+        "max_depth": int(args.max_depth),
+        "inner_steps": int(args.inner_steps),
+        "eps_grad": float(args.eps_grad),
+        "eps_energy": float(args.eps_energy),
+        "ham_params": dict(system_json["ham_params"]),
+        "budget": dict(args.budget),
+        "exact_energy": float(exact_sector),
+        "exact_energy_full": float(exact),
+        "occ": list(map(int, occupations)),
+        "seed": int(args.seed),
+        "weights": args.weights,
+        "store": str(args.store),
+        "db_path": str(args.db),
+        "logdir": str(args.logdir),
+        "python": sys.version,
+        "platform": platform.platform(),
+        **git_info,
+        "cli": vars(args),
+        "system": system_json,
+        "ansatz": ansatz_json,
+        "optimizer": optimizer_json,
+    }
+
+    store_kind = str(args.store)
+    if store_kind == "sqlite":
+        store = MultiRunStore([SqliteRunStore(args.db), JsonRunStore(base_dir=args.logdir)])
+    elif store_kind == "json":
+        store = JsonRunStore(base_dir=args.logdir)
+    else:
+        raise ValueError(f"Unknown store kind: {store_kind}")
+
+    # If the backend rewrites/chooses the run_id, use the returned value.
+    run_id = store.start_run(run_config)
+    logger = RunStoreLogger(store, run_id)
+
     cost = CostCounters()
     estimator = CountingEstimator(StatevectorEstimator(), cost)
+    status = "completed"
+    summary: dict[str, object] = {}
+    result = None
+    ops_out: list[str] = []
     try:
         result = run_meta_adapt_vqe(
             qubit_op,
@@ -404,85 +551,126 @@ def main() -> None:
             log_every=args.log_every,
             verbose=not args.quiet,
         )
+
+        for op in result.operators:
+            if isinstance(op, dict) and "name" in op:
+                ops_out.append(str(op["name"]))
+            else:
+                ops_out.append(str(op))
+
+        print("Meta-ADAPT-VQE (Statevector)")
+        print(f"t={args.t}, U={args.u}, dv={args.dv}")
+        print(f"Exact ground energy (full):   {exact:.8f}")
+        print(f"Exact ground energy (sector): {exact_sector:.8f}")
+        print(f"Meta-ADAPT energy:            {result.energy:.8f}")
+        print(f"Abs diff (sector):            {abs(result.energy - exact_sector):.8e}")
+        print(f"Depth:              {len(result.operators)}")
+
+        if result.diagnostics.get("outer"):
+            first = result.diagnostics["outer"][0]
+            print(f"max|g| at n=0:      {first['max_grad']:.6e}")
+            print(f"chosen operator:    {first['chosen_op']}")
+            if args.pool in {"cse_density_ops", "uccsd_excitations"}:
+                pool_size = result.diagnostics.get("pool_size", [None])[0]
+                print(f"pool size:          {pool_size}")
+                comps = first.get("chosen_components") or []
+                comp_preview = ", ".join(f"{lbl}:{wt:.3f}" for lbl, wt in comps[:6])
+                if len(comps) > 6:
+                    comp_preview += ", ..."
+                if comp_preview:
+                    print(f"components:         {comp_preview}")
+            last = result.diagnostics["outer"][-1]
+            if last.get("inner_optimizer") == "lbfgs":
+                stats = last.get("inner_stats") or {}
+                print(f"lbfgs nfev:         {stats.get('nfev')}")
+                print(f"lbfgs njev:         {stats.get('njev')}")
+                print(f"lbfgs restarts:     {stats.get('restarts')}")
+            elif last.get("inner_optimizer") == "meta":
+                stats = last.get("inner_stats") or {}
+                print(f"meta avg||Δθ||:     {stats.get('avg_delta_norm')}")
+            elif last.get("inner_optimizer") == "hybrid":
+                stats = last.get("inner_stats") or {}
+                meta_stats = stats.get("meta", {})
+                warm_stats = stats.get("warm", {})
+                polish_stats = stats.get("polish", {})
+                print(f"meta avg||Δθ||:     {meta_stats.get('avg_delta_norm')}")
+                print(f"warm nfev:          {warm_stats.get('nfev')}")
+                print(f"polish nfev:        {polish_stats.get('nfev')}")
+
+        if args.save:
+            _save_result(args.save, result.energy, result.params, ops_out)
+            sha = sha256_file(args.save)
+            b = Path(args.save).stat().st_size
+            store.add_artifact(run_id, kind="result_export_json", path=str(args.save), sha256=sha, bytes=int(b), extra=None)
+            print(f"Saved: {args.save}")
+
+        if args.enforce_sector:
+            n_q, sz_q = map_symmetry_ops_to_qubits(_mapper, args.sites)
+            from qiskit.quantum_info import Statevector
+            from pydephasing.quantum.vqe.adapt_vqe_meta import build_adapt_circuit, build_adapt_circuit_grouped
+            if args.pool in {"cse_density_ops", "uccsd_excitations"}:
+                circuit, params = build_adapt_circuit_grouped(reference_state, result.operators)
+            else:
+                circuit, params = build_adapt_circuit(reference_state, result.operators)
+            bound = circuit.assign_parameters({p: v for p, v in zip(params, result.params)}, inplace=False)
+            state = Statevector.from_instruction(bound)
+            n_val = float(np.real(state.expectation_value(n_q)))
+            sz_val = float(np.real(state.expectation_value(sz_q)))
+            if abs(n_val - (args.n_up + args.n_down)) > 1e-6 or abs(sz_val - 0.5 * (args.n_up - args.n_down)) > 1e-6:
+                raise RuntimeError("Statevector left target sector.")
+            if result.energy < exact_sector - 1e-9:
+                raise RuntimeError("VQE energy below exact sector energy.")
+
+        summary = {
+            "energy": float(result.energy),
+            "theta": list(map(float, result.params)),
+            "operators": ops_out,
+            "exact_full": float(exact),
+            "exact_sector": float(exact_sector),
+            "abs_delta_e_sector": float(abs(float(result.energy) - float(exact_sector))),
+            "stop_reason": result.diagnostics.get("stop_reason"),
+            "pool": str(args.pool),
+            "cost": cost.snapshot(),
+        }
+    except Exception as exc:
+        status = "error"
+        summary = {"error": str(exc), "traceback": traceback.format_exc()}
+        raise
     finally:
-        logger.close()
+        try:
+            store.finish_run(run_id, status=status, summary_metrics=summary)
 
-    print("Meta-ADAPT-VQE (Statevector)")
-    print(f"t={args.t}, U={args.u}, dv={args.dv}")
-    exact_sector = exact_ground_energy_sector(
-        qubit_op,
-        args.sites,
-        args.n_up + args.n_down,
-        0.5 * (args.n_up - args.n_down),
-    )
-    update_meta_exact_energy(run_dir, exact_sector)
-
-    # Persist final parameters and operator sequence for downstream benchmarking
-    # (fidelity/variance/observables reconstruction, etc.).
-    ops_out: list[str] = []
-    for op in result.operators:
-        if isinstance(op, dict) and "name" in op:
-            ops_out.append(str(op["name"]))
-        else:
-            ops_out.append(str(op))
-    _save_result(str(run_dir / "result.json"), result.energy, result.params, ops_out)
-
-    print(f"Exact ground energy (full):   {exact:.8f}")
-    print(f"Exact ground energy (sector): {exact_sector:.8f}")
-    print(f"Meta-ADAPT energy:            {result.energy:.8f}")
-    print(f"Abs diff (sector):            {abs(result.energy - exact_sector):.8e}")
-    print(f"Depth:              {len(result.operators)}")
-    if result.diagnostics.get("outer"):
-        first = result.diagnostics["outer"][0]
-        print(f"max|g| at n=0:      {first['max_grad']:.6e}")
-        print(f"chosen operator:    {first['chosen_op']}")
-        if args.pool in {"cse_density_ops", "uccsd_excitations"}:
-            pool_size = result.diagnostics.get("pool_size", [None])[0]
-            print(f"pool size:          {pool_size}")
-            comps = first.get("chosen_components") or []
-            comp_preview = ", ".join(f"{lbl}:{wt:.3f}" for lbl, wt in comps[:6])
-            if len(comps) > 6:
-                comp_preview += ", ..."
-            if comp_preview:
-                print(f"components:         {comp_preview}")
-        last = result.diagnostics["outer"][-1]
-        if last.get("inner_optimizer") == "lbfgs":
-            stats = last.get("inner_stats") or {}
-            print(f"lbfgs nfev:         {stats.get('nfev')}")
-            print(f"lbfgs njev:         {stats.get('njev')}")
-            print(f"lbfgs restarts:     {stats.get('restarts')}")
-        elif last.get("inner_optimizer") == "meta":
-            stats = last.get("inner_stats") or {}
-            print(f"meta avg||Δθ||:     {stats.get('avg_delta_norm')}")
-        elif last.get("inner_optimizer") == "hybrid":
-            stats = last.get("inner_stats") or {}
-            meta_stats = stats.get("meta", {})
-            warm_stats = stats.get("warm", {})
-            polish_stats = stats.get("polish", {})
-            print(f"meta avg||Δθ||:     {meta_stats.get('avg_delta_norm')}")
-            print(f"warm nfev:          {warm_stats.get('nfev')}")
-            print(f"polish nfev:        {polish_stats.get('nfev')}")
-
-    if args.save:
-        _save_result(args.save, result.energy, result.params, result.operators)
-        print(f"Saved: {args.save}")
-
-    if args.enforce_sector:
-        n_q, sz_q = map_symmetry_ops_to_qubits(_mapper, args.sites)
-        from qiskit.quantum_info import Statevector
-        from pydephasing.quantum.vqe.adapt_vqe_meta import build_adapt_circuit, build_adapt_circuit_grouped
-        if args.pool in {"cse_density_ops", "uccsd_excitations"}:
-            circuit, params = build_adapt_circuit_grouped(reference_state, result.operators)
-        else:
-            circuit, params = build_adapt_circuit(reference_state, result.operators)
-        bound = circuit.assign_parameters({p: v for p, v in zip(params, result.params)}, inplace=False)
-        state = Statevector.from_instruction(bound)
-        n_val = float(np.real(state.expectation_value(n_q)))
-        sz_val = float(np.real(state.expectation_value(sz_q)))
-        if abs(n_val - (args.n_up + args.n_down)) > 1e-6 or abs(sz_val - 0.5 * (args.n_up - args.n_down)) > 1e-6:
-            raise RuntimeError("Statevector left target sector.")
-        if result.energy < exact_sector - 1e-9:
-            raise RuntimeError("VQE energy below exact sector energy.")
+            # Register the legacy JSON artifacts in the DB so plotting/query tools
+            # can back-reference the exact files used.
+            run_dir = Path(args.logdir) / f"{run_id}_L{args.sites}_Nup{args.n_up}_Ndown{args.n_down}"
+            if status == "error" and isinstance(summary, dict) and summary.get("traceback"):
+                tb_path = run_dir / "traceback.txt"
+                tb_path.write_text(str(summary["traceback"]) + "\n", encoding="utf-8")
+                store.add_artifact(
+                    run_id,
+                    kind="traceback_txt",
+                    path=str(tb_path),
+                    sha256=sha256_file(tb_path),
+                    bytes=int(tb_path.stat().st_size),
+                    extra=None,
+                )
+            for kind, p in [
+                ("legacy_meta_json", run_dir / "meta.json"),
+                ("legacy_history_jsonl", run_dir / "history.jsonl"),
+                ("legacy_result_json", run_dir / "result.json"),
+            ]:
+                if p.exists():
+                    store.add_artifact(
+                        run_id,
+                        kind=kind,
+                        path=str(p),
+                        sha256=sha256_file(p),
+                        bytes=int(p.stat().st_size),
+                        extra=None,
+                    )
+        finally:
+            if hasattr(store, "close"):
+                store.close()
 
 
 if __name__ == "__main__":

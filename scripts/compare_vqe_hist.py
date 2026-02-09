@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Callable
 
@@ -37,6 +39,13 @@ from pydephasing.quantum.vqe.adapt_vqe_meta import (
     run_meta_adapt_vqe,
 )
 from pydephasing.quantum.vqe.cost_model import CostCounters, CountingEstimator
+from pydephasing.quantum.vqe.run_store import (
+    JsonRunStore,
+    MultiRunStore,
+    RunStoreLogger,
+    SqliteRunStore,
+    sha256_file,
+)
 
 
 def sector_occ(n_sites: int, n_up: int, n_down: int) -> list[int]:
@@ -127,7 +136,10 @@ def find_adapt_run_dir(
             continue
         meta_path = run_dir / "meta.json"
         hist_path = run_dir / "history.jsonl"
-        if not meta_path.exists() or not hist_path.exists():
+        # Require result.json so we don't accidentally cache an interrupted run
+        # (which may contain only partial history rows).
+        result_path = run_dir / "result.json"
+        if not meta_path.exists() or not hist_path.exists() or not result_path.exists():
             continue
         try:
             meta = json.loads(meta_path.read_text())
@@ -193,11 +205,12 @@ def make_adapt_run_dir(
     max_pauli_terms_measured: int | None = None,
     max_circuits_executed: int | None = None,
     max_time_s: float | None = None,
-) -> Path:
+) -> tuple[Path, dict]:
     run_dir = runs_root / f"{run_id}_L{n_sites}_Nup{n_up}_Ndown{n_down}"
     run_dir.mkdir(parents=True, exist_ok=True)
     meta = {
         "run_id": run_id,
+        "run_dir": str(run_dir.resolve()),
         "sites": n_sites,
         "n_up": n_up,
         "n_down": n_down,
@@ -221,8 +234,7 @@ def make_adapt_run_dir(
         "python": sys.version,
         "platform": platform.platform(),
     }
-    (run_dir / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True))
-    return run_dir
+    return run_dir, meta
 
 
 def load_cse_operator_specs(
@@ -300,13 +312,18 @@ def run_regular_vqe(
     vqe_maxiter_per_param: int = 25,
     vqe_maxiter_cap: int = 5000,
     vqe_maxiter_budget_cap: int = 100000,
+    store=None,
+    run_id: str | None = None,
 ) -> float:
-    log_path = None
-    log_file = None
+    use_store = store is not None
+    store_run_id: str | None = None
+
     if log_dir is not None:
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "history.jsonl"
-        log_file = open(log_path, "w", encoding="utf-8")
+
+    log_file = None
+    if log_dir is not None and not use_store:
+        log_file = open(log_dir / "history.jsonl", "w", encoding="utf-8")
 
     cost = CostCounters()
     estimator = CountingEstimator(StatevectorEstimator(), cost)
@@ -342,6 +359,31 @@ def run_regular_vqe(
     best_params: list[float] | None = None
     stop_reason: str | None = None
 
+    if use_store:
+        if log_dir is None:
+            raise ValueError("store logging requires log_dir to persist legacy artifacts.")
+        # Ensure run_id is unique even if the same log_dir is reused across runs.
+        run_id = run_id or f"vqe_{ansatz_kind}_{int(time.time())}_L{n_sites}_Nup{num_particles[0]}_Ndown{num_particles[1]}"
+        run_config = {
+            "run_id": str(run_id),
+            "run_dir": str(log_dir.resolve()),
+            "sites": int(n_sites),
+            "n_up": int(num_particles[0]),
+            "n_down": int(num_particles[1]),
+            "reps": int(reps),
+            "seed": int(seed),
+            "exact_energy": float(exact_energy),
+            "budget": {
+                "max_pauli_terms_measured": None if max_pauli_terms_measured is None else int(max_pauli_terms_measured),
+                "max_circuits_executed": None if max_circuits_executed is None else int(max_circuits_executed),
+                "max_time_s": None if max_time_s is None else float(max_time_s),
+            },
+            "optimizer": {"name": "COBYLA", "maxiter": int(maxiter)},
+            "system": {"sites": int(n_sites), "n_up": int(num_particles[0]), "n_down": int(num_particles[1])},
+            "ansatz": {"kind": str(ansatz_kind), "reps": int(reps)},
+        }
+        store_run_id = str(store.start_run(run_config))
+
     def _budget_reason() -> str | None:
         if max_time_s is not None and (time.perf_counter() - t_start) >= float(max_time_s):
             return "max_time_s"
@@ -361,9 +403,6 @@ def run_regular_vqe(
             # in the callback; only trust it if it matches the ansatz size.
             if int(params_vec.size) == ansatz_num_params:
                 best_params = list(map(float, params_vec))
-
-        if log_file is None:
-            return
 
         now = time.perf_counter()
         t_iter_s = now - t_last
@@ -391,8 +430,13 @@ def run_regular_vqe(
             stop_reason = f"budget:{reason}"
             row["stop_reason"] = stop_reason
 
-        log_file.write(json.dumps(row) + "\n")
-        log_file.flush()
+        if use_store and store_run_id is not None:
+            metrics = dict(row)
+            metrics.pop("iter", None)
+            store.log_step(store_run_id, int(eval_count), metrics)
+        elif log_file is not None:
+            log_file.write(json.dumps(row) + "\n")
+            log_file.flush()
 
         if reason is not None:
             raise BudgetExceeded(reason, best_energy=best_energy)
@@ -405,45 +449,78 @@ def run_regular_vqe(
         callback=_callback,
     )
 
-    energy_out: float
-    opt_out: list[float] | None
+    def _finalize(*, status: str, payload: dict) -> None:
+        if log_dir is None:
+            return
+        if use_store and store_run_id is not None:
+            store.finish_run(store_run_id, status=str(status), summary_metrics=payload)
+            for kind, p in [
+                ("legacy_meta_json", log_dir / "meta.json"),
+                ("legacy_history_jsonl", log_dir / "history.jsonl"),
+                ("legacy_result_json", log_dir / "result.json"),
+            ]:
+                if p.exists():
+                    store.add_artifact(
+                        store_run_id,
+                        kind=kind,
+                        path=str(p),
+                        sha256=sha256_file(p),
+                        bytes=int(p.stat().st_size),
+                        extra=None,
+                    )
+        else:
+            (log_dir / "result.json").write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+    energy_out: float = float("nan")
+    opt_out: list[float] | None = None
+    status_out = "completed"
+    payload: dict[str, object]
     try:
-        result = vqe.compute_minimum_eigenvalue(qubit_op)
-    except BudgetExceeded as exc:
-        stop_reason = stop_reason or f"budget:{exc.reason}"
-        energy_out = float(best_energy) if best_energy is not None else float("nan")
-        opt_out = (
-            best_params
-            if best_params is not None and len(best_params) == ansatz_num_params
-            else None
-        )
-    except Exception:
-        # Some SciPy-backed optimizers (notably COBYLA) may surface Python
-        # exceptions from callbacks as low-level errors (e.g. "capi_return is NULL").
-        # If we already logged a budget stop and have a best-so-far energy, treat it
-        # as an intentional abort.
-        if stop_reason is not None and stop_reason.startswith("budget:") and best_energy is not None:
-            energy_out = float(best_energy)
+        try:
+            result = vqe.compute_minimum_eigenvalue(qubit_op)
+        except BudgetExceeded as exc:
+            stop_reason = stop_reason or f"budget:{exc.reason}"
+            status_out = "stopped"
+            energy_out = float(best_energy) if best_energy is not None else float("nan")
             opt_out = (
                 best_params
                 if best_params is not None and len(best_params) == ansatz_num_params
                 else None
             )
+        except Exception:
+            # Some SciPy-backed optimizers (notably COBYLA) may surface Python
+            # exceptions from callbacks as low-level errors (e.g. "capi_return is NULL").
+            # If we already logged a budget stop and have a best-so-far energy, treat it
+            # as an intentional abort.
+            if (
+                stop_reason is not None
+                and stop_reason.startswith("budget:")
+                and best_energy is not None
+            ):
+                status_out = "stopped"
+                energy_out = float(best_energy)
+                opt_out = (
+                    best_params
+                    if best_params is not None and len(best_params) == ansatz_num_params
+                    else None
+                )
+            else:
+                raise
         else:
-            raise
-    else:
-        final_e = float(np.real(result.eigenvalue))
-        # For non-aborted runs, trust the optimizer result for parameters.
-        opt_out = (
-            list(map(float, result.optimal_point))
-            if result.optimal_point is not None
-            else None
-        )
-        if opt_out is not None and len(opt_out) != ansatz_num_params:
-            opt_out = None
-        energy_out = float(final_e)
+            final_e = float(np.real(result.eigenvalue))
+            # For non-aborted runs, trust the optimizer result for parameters.
+            opt_out = (
+                list(map(float, result.optimal_point))
+                if result.optimal_point is not None
+                else None
+            )
+            if opt_out is not None and len(opt_out) != ansatz_num_params:
+                opt_out = None
+            energy_out = float(final_e)
 
-    if log_dir is not None:
         payload = {
             "ansatz": str(ansatz_kind),
             "n_params": int(ansatz_num_params),
@@ -465,9 +542,34 @@ def run_regular_vqe(
                 "max_time_s": None if max_time_s is None else float(max_time_s),
             },
         }
-        (log_dir / "result.json").write_text(json.dumps(payload, indent=2, sort_keys=True))
-    if log_file is not None:
-        log_file.close()
+        _finalize(status=status_out, payload=payload)
+    except Exception as exc:
+        payload = {
+            "ansatz": str(ansatz_kind),
+            "n_params": int(ansatz_num_params),
+            "n_sites": int(n_sites),
+            "num_particles": [int(num_particles[0]), int(num_particles[1])],
+            "reps": int(reps),
+            "seed": int(seed),
+            "optimizer": {"name": "COBYLA", "maxiter": int(maxiter)},
+            "budget": {
+                "max_pauli_terms_measured": None
+                if max_pauli_terms_measured is None
+                else int(max_pauli_terms_measured),
+                "max_circuits_executed": None
+                if max_circuits_executed is None
+                else int(max_circuits_executed),
+                "max_time_s": None if max_time_s is None else float(max_time_s),
+            },
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+        _finalize(status="error", payload=payload)
+        raise
+    finally:
+        if log_file is not None:
+            log_file.close()
+
     # Return best-so-far energy from the log when available (more robust than trusting
     # any single termination point).
     if log_dir is not None:
@@ -496,13 +598,18 @@ def run_vqe_cse_ops(
     vqe_maxiter_per_param: int = 25,
     vqe_maxiter_cap: int = 5000,
     vqe_maxiter_budget_cap: int = 100000,
+    store=None,
+    run_id: str | None = None,
 ) -> float:
-    log_path = None
-    log_file = None
+    use_store = store is not None
+    store_run_id: str | None = None
+
     if log_dir is not None:
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "history.jsonl"
-        log_file = open(log_path, "w", encoding="utf-8")
+
+    log_file = None
+    if log_dir is not None and not use_store:
+        log_file = open(log_dir / "history.jsonl", "w", encoding="utf-8")
 
     ops = load_cse_operator_specs(
         runs_root=runs_root,
@@ -542,6 +649,29 @@ def run_vqe_cse_ops(
     best_params: list[float] | None = None
     stop_reason: str | None = None
 
+    if use_store:
+        if log_dir is None:
+            raise ValueError("store logging requires log_dir to persist legacy artifacts.")
+        run_id = run_id or f"vqe_cse_ops_{int(time.time())}_L{n_sites}_Nup{n_up}_Ndown{n_down}"
+        run_config = {
+            "run_id": str(run_id),
+            "run_dir": str(log_dir.resolve()),
+            "sites": int(n_sites),
+            "n_up": int(n_up),
+            "n_down": int(n_down),
+            "ansatz": {"kind": "vqe_cse_ops"},
+            "seed": int(seed),
+            "exact_energy": float(exact_energy),
+            "budget": {
+                "max_pauli_terms_measured": None if max_pauli_terms_measured is None else int(max_pauli_terms_measured),
+                "max_circuits_executed": None if max_circuits_executed is None else int(max_circuits_executed),
+                "max_time_s": None if max_time_s is None else float(max_time_s),
+            },
+            "optimizer": {"name": "COBYLA", "maxiter": int(maxiter)},
+            "system": {"sites": int(n_sites), "n_up": int(n_up), "n_down": int(n_down)},
+        }
+        store_run_id = str(store.start_run(run_config))
+
     def _budget_reason() -> str | None:
         if max_time_s is not None and (time.perf_counter() - t_start) >= float(max_time_s):
             return "max_time_s"
@@ -559,8 +689,6 @@ def run_vqe_cse_ops(
             best_energy = e
             if int(params_vec.size) == ansatz_num_params:
                 best_params = list(map(float, params_vec))
-        if log_file is None:
-            return
         now = time.perf_counter()
         t_iter_s = now - t_last
         t_cum_s = now - t_start
@@ -583,8 +711,13 @@ def run_vqe_cse_ops(
         if reason is not None:
             stop_reason = f"budget:{reason}"
             row["stop_reason"] = stop_reason
-        log_file.write(json.dumps(row) + "\n")
-        log_file.flush()
+        if use_store and store_run_id is not None:
+            metrics = dict(row)
+            metrics.pop("iter", None)
+            store.log_step(store_run_id, int(eval_count), metrics)
+        elif log_file is not None:
+            log_file.write(json.dumps(row) + "\n")
+            log_file.flush()
         if reason is not None:
             raise BudgetExceeded(reason, best_energy=best_energy)
 
@@ -595,39 +728,73 @@ def run_vqe_cse_ops(
         initial_point=initial_point,
         callback=_callback,
     )
-    energy_out: float
-    opt_out: list[float] | None
+    def _finalize(*, status: str, payload: dict) -> None:
+        if log_dir is None:
+            return
+        if use_store and store_run_id is not None:
+            store.finish_run(store_run_id, status=str(status), summary_metrics=payload)
+            for kind, p in [
+                ("legacy_meta_json", log_dir / "meta.json"),
+                ("legacy_history_jsonl", log_dir / "history.jsonl"),
+                ("legacy_result_json", log_dir / "result.json"),
+            ]:
+                if p.exists():
+                    store.add_artifact(
+                        store_run_id,
+                        kind=kind,
+                        path=str(p),
+                        sha256=sha256_file(p),
+                        bytes=int(p.stat().st_size),
+                        extra=None,
+                    )
+        else:
+            (log_dir / "result.json").write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+    energy_out: float = float("nan")
+    opt_out: list[float] | None = None
+    status_out = "completed"
+    payload: dict[str, object]
     try:
-        result = vqe.compute_minimum_eigenvalue(qubit_op)
-    except BudgetExceeded as exc:
-        stop_reason = stop_reason or f"budget:{exc.reason}"
-        energy_out = float(best_energy) if best_energy is not None else float("nan")
-        opt_out = (
-            best_params
-            if best_params is not None and len(best_params) == ansatz_num_params
-            else None
-        )
-    except Exception:
-        if stop_reason is not None and stop_reason.startswith("budget:") and best_energy is not None:
-            energy_out = float(best_energy)
+        try:
+            result = vqe.compute_minimum_eigenvalue(qubit_op)
+        except BudgetExceeded as exc:
+            stop_reason = stop_reason or f"budget:{exc.reason}"
+            status_out = "stopped"
+            energy_out = float(best_energy) if best_energy is not None else float("nan")
             opt_out = (
                 best_params
                 if best_params is not None and len(best_params) == ansatz_num_params
                 else None
             )
+        except Exception:
+            if (
+                stop_reason is not None
+                and stop_reason.startswith("budget:")
+                and best_energy is not None
+            ):
+                status_out = "stopped"
+                energy_out = float(best_energy)
+                opt_out = (
+                    best_params
+                    if best_params is not None and len(best_params) == ansatz_num_params
+                    else None
+                )
+            else:
+                raise
         else:
-            raise
-    else:
-        final_e = float(np.real(result.eigenvalue))
-        opt_out = (
-            list(map(float, result.optimal_point))
-            if result.optimal_point is not None
-            else None
-        )
-        if opt_out is not None and len(opt_out) != ansatz_num_params:
-            opt_out = None
-        energy_out = float(final_e)
-    if log_dir is not None:
+            final_e = float(np.real(result.eigenvalue))
+            opt_out = (
+                list(map(float, result.optimal_point))
+                if result.optimal_point is not None
+                else None
+            )
+            if opt_out is not None and len(opt_out) != ansatz_num_params:
+                opt_out = None
+            energy_out = float(final_e)
+
         payload = {
             "ansatz": "vqe_cse_ops",
             "n_params": int(ansatz_num_params),
@@ -648,9 +815,33 @@ def run_vqe_cse_ops(
                 "max_time_s": None if max_time_s is None else float(max_time_s),
             },
         }
-        (log_dir / "result.json").write_text(json.dumps(payload, indent=2, sort_keys=True))
-    if log_file is not None:
-        log_file.close()
+        _finalize(status=status_out, payload=payload)
+    except Exception as exc:
+        payload = {
+            "ansatz": "vqe_cse_ops",
+            "n_params": int(ansatz_num_params),
+            "n_sites": int(n_sites),
+            "num_particles": [int(n_up), int(n_down)],
+            "seed": int(seed),
+            "optimizer": {"name": "COBYLA", "maxiter": int(maxiter)},
+            "budget": {
+                "max_pauli_terms_measured": None
+                if max_pauli_terms_measured is None
+                else int(max_pauli_terms_measured),
+                "max_circuits_executed": None
+                if max_circuits_executed is None
+                else int(max_circuits_executed),
+                "max_time_s": None if max_time_s is None else float(max_time_s),
+            },
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+        _finalize(status="error", payload=payload)
+        raise
+    finally:
+        if log_file is not None:
+            log_file.close()
+
     if log_dir is not None:
         best_logged = _best_energy_from_log(log_dir)
         if best_logged is not None:
@@ -790,6 +981,19 @@ def main() -> None:
         ),
     )
     ap.add_argument("--out-dir", type=str, default="runs/compare_vqe")
+    ap.add_argument(
+        "--store",
+        type=str,
+        choices=["sqlite", "json"],
+        default=os.environ.get("RUN_STORE", "sqlite"),
+        help="Run storage backend (env: RUN_STORE).",
+    )
+    ap.add_argument(
+        "--db",
+        type=str,
+        default=os.environ.get("RUNS_DB_PATH", "data/runs.db"),
+        help="SQLite DB path when --store sqlite (env: RUNS_DB_PATH).",
+    )
     ap.add_argument("--force", action="store_true")
     ap.add_argument(
         "--allow-exact-compute",
@@ -814,6 +1018,38 @@ def main() -> None:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    store_kind = str(args.store)
+    if store_kind == "sqlite":
+        # Migration mode: default to SQLite, but also emit legacy JSON artifacts so
+        # the existing plotting/caching pipeline under runs/ keeps working.
+        store = MultiRunStore([SqliteRunStore(args.db), JsonRunStore(base_dir=".")])
+    elif store_kind == "json":
+        store = JsonRunStore(base_dir=".")
+    else:
+        raise ValueError(f"Unknown store kind: {store_kind}")
+
+    batch_run_id = f"compare_vqe_hist_{time.time_ns()}"
+    batch_run_dir = (out_dir / batch_run_id).resolve()
+    batch_run_dir.mkdir(parents=True, exist_ok=True)
+    store.start_run(
+        {
+            "run_id": batch_run_id,
+            "run_dir": str(batch_run_dir),
+            "entrypoint": "scripts/compare_vqe_hist.py",
+            "sites": list(map(int, args.sites)),
+            "odd_policy": str(args.odd_policy),
+            "budget": {
+                "budget_k": None if args.no_budget else float(args.budget_k),
+                "max_pauli_terms_measured": None if args.no_budget else args.max_pauli_terms,
+                "max_circuits_executed": None if args.no_budget else args.max_circuits,
+                "max_time_s": None if args.no_budget else args.max_time_s,
+            },
+            "store": str(args.store),
+            "db_path": str(args.db),
+            "cli": vars(args),
+        }
+    )
 
     t = 1.0
     u = 4.0
@@ -856,250 +1092,306 @@ def main() -> None:
     row_map = _rows_by_key(rows)
     row_map = {k: v for k, v in row_map.items() if v.get("ansatz") in allowed_ansatz}
 
-    for n_sites in sites:
-        if n_sites not in sectors:
-            raise ValueError(f"Missing sector mapping for L={n_sites}")
-        n_up, n_down = sectors[n_sites]
+    try:
+        for n_sites in sites:
+            if n_sites not in sectors:
+                raise ValueError(f"Missing sector mapping for L={n_sites}")
+            n_up, n_down = sectors[n_sites]
 
-        if args.no_budget:
-            max_pauli_terms_measured = None
-            max_circuits_executed = None
-            max_time_s = None
-        else:
-            max_pauli_terms_measured = (
-                int(args.max_pauli_terms)
-                if args.max_pauli_terms is not None
-                else int(float(args.budget_k) * (int(n_sites) ** 2))
-            )
-            max_circuits_executed = (
-                int(args.max_circuits) if args.max_circuits is not None else None
-            )
-            max_time_s = float(args.max_time_s) if args.max_time_s is not None else None
-
-        # Determine if anything is missing for this site.
-        missing = []
-        for kind in adapt_kinds + vqe_kinds:
-            if args.force or (n_sites, n_up, n_down, kind) not in row_map:
-                missing.append(kind)
-        if not missing:
-            print(f"L={n_sites}: using cached comparison rows.")
-            continue
-
-        ferm_op = build_fermionic_hubbard(
-            n_sites=n_sites,
-            t=t,
-            u=u,
-            edges=default_1d_chain_edges(n_sites, periodic=False),
-            v=[-dv / 2, dv / 2] if n_sites == 2 else None,
-        )
-        qubit_op, mapper = build_qubit_hamiltonian_from_fermionic(ferm_op)
-        exact = load_cached_exact_energy(
-            runs_root,
-            n_sites=n_sites,
-            n_up=n_up,
-            n_down=n_down,
-        )
-        if exact is None:
-            if not args.allow_exact_compute:
-                raise RuntimeError(
-                    f"Exact energy not cached for L={n_sites}. "
-                    "Provide it or rerun with --allow-exact-compute."
+            if args.no_budget:
+                max_pauli_terms_measured = None
+                max_circuits_executed = None
+                max_time_s = None
+            else:
+                max_pauli_terms_measured = (
+                    int(args.max_pauli_terms)
+                    if args.max_pauli_terms is not None
+                    else int(float(args.budget_k) * (int(n_sites) ** 2))
                 )
-            exact = exact_ground_energy_sector(
-                qubit_op,
-                n_sites,
-                n_up + n_down,
-                0.5 * (n_up - n_down),
-            )
+                max_circuits_executed = (
+                    int(args.max_circuits) if args.max_circuits is not None else None
+                )
+                max_time_s = float(args.max_time_s) if args.max_time_s is not None else None
 
-        if "adapt_cse_hybrid" in missing:
-            adapt_e = None
-            if not args.force:
-                try:
-                    adapt_e = load_cached_adapt_energy(
+            # Determine if anything is missing for this site.
+            missing = []
+            for kind in adapt_kinds + vqe_kinds:
+                if args.force or (n_sites, n_up, n_down, kind) not in row_map:
+                    missing.append(kind)
+            if not missing:
+                print(f"L={n_sites}: using cached comparison rows.")
+                continue
+
+            ferm_op = build_fermionic_hubbard(
+                n_sites=n_sites,
+                t=t,
+                u=u,
+                edges=default_1d_chain_edges(n_sites, periodic=False),
+                v=[-dv / 2, dv / 2] if n_sites == 2 else None,
+            )
+            qubit_op, mapper = build_qubit_hamiltonian_from_fermionic(ferm_op)
+            exact = load_cached_exact_energy(
+                runs_root,
+                n_sites=n_sites,
+                n_up=n_up,
+                n_down=n_down,
+            )
+            if exact is None:
+                if not args.allow_exact_compute:
+                    raise RuntimeError(
+                        f"Exact energy not cached for L={n_sites}. "
+                        "Provide it or rerun with --allow-exact-compute."
+                    )
+                exact = exact_ground_energy_sector(
+                    qubit_op,
+                    n_sites,
+                    n_up + n_down,
+                    0.5 * (n_up - n_down),
+                )
+
+            if "adapt_cse_hybrid" in missing:
+                adapt_e = None
+                if not args.force:
+                    try:
+                        adapt_e = load_cached_adapt_energy(
+                            runs_root,
+                            n_sites=n_sites,
+                            n_up=n_up,
+                            n_down=n_down,
+                            pool="cse_density_ops",
+                        )
+                    except Exception:
+                        adapt_e = None
+                if adapt_e is None:
+                    settings = adapt_settings(n_sites, "cse_density_ops")
+                    run_id = f"adapt_cse_{time.time_ns()}"
+                    run_dir, meta = make_adapt_run_dir(
                         runs_root,
+                        run_id=run_id,
                         n_sites=n_sites,
                         n_up=n_up,
                         n_down=n_down,
                         pool="cse_density_ops",
-                    )
-                except Exception:
-                    adapt_e = None
-            if adapt_e is None:
-                settings = adapt_settings(n_sites, "cse_density_ops")
-                run_id = f"adapt_cse_{int(time.time())}"
-                run_dir = make_adapt_run_dir(
-                    runs_root,
-                    run_id=run_id,
-                    n_sites=n_sites,
-                    n_up=n_up,
-                    n_down=n_down,
-                    pool="cse_density_ops",
-                    inner_optimizer="hybrid",
-                    max_depth=settings["max_depth"],
-                    eps_grad=1e-4,
-                    eps_energy=1e-3,
-                    t=t,
-                    u=u,
-                    dv=dv,
-                    exact_energy=exact,
-                    budget_k=None if args.no_budget else float(args.budget_k),
-                    max_pauli_terms_measured=max_pauli_terms_measured,
-                    max_circuits_executed=max_circuits_executed,
-                    max_time_s=max_time_s,
-                )
-                logger = RunLogger(run_dir)
-                try:
-                    adapt_result = run_adapt(
-                        n_sites=n_sites,
-                        ferm_op=ferm_op,
-                        qubit_op=qubit_op,
-                        mapper=mapper,
-                        n_up=n_up,
-                        n_down=n_down,
-                        pool_mode="cse_density_ops",
-                        logger=logger,
+                        inner_optimizer="hybrid",
                         max_depth=settings["max_depth"],
-                        inner_steps=settings["inner_steps"],
-                        warmup_steps=settings["warmup_steps"],
-                        polish_steps=settings["polish_steps"],
+                        eps_grad=1e-4,
+                        eps_energy=1e-3,
+                        t=t,
+                        u=u,
+                        dv=dv,
+                        exact_energy=exact,
+                        budget_k=None if args.no_budget else float(args.budget_k),
                         max_pauli_terms_measured=max_pauli_terms_measured,
                         max_circuits_executed=max_circuits_executed,
                         max_time_s=max_time_s,
-                        inner_steps_schedule=inner_steps_schedule,
                     )
-                    adapt_e_final = float(adapt_result.energy)
-                    adapt_e_best = _best_energy_from_log(run_dir) or adapt_e_final
-                    adapt_e = float(adapt_e_best)
-                    # Persist for downstream reconstruction (fidelity/observables/etc).
-                    ops_out = [str(op.get("name")) for op in adapt_result.operators]
-                    payload = {
-                        "energy": float(adapt_e_final),
-                        "best_energy": float(adapt_e_best),
-                        "theta": list(map(float, adapt_result.params)),
-                        "operators": ops_out,
-                        "pool": "cse_density_ops",
-                        "stop_reason": adapt_result.diagnostics.get("stop_reason"),
-                        "budget": {
-                            "budget_k": None if args.no_budget else float(args.budget_k),
-                            "max_pauli_terms_measured": max_pauli_terms_measured,
-                            "max_circuits_executed": max_circuits_executed,
-                            "max_time_s": max_time_s,
-                        },
-                    }
-                    (run_dir / "result.json").write_text(json.dumps(payload, indent=2, sort_keys=True))
-                finally:
-                    logger.close()
-            row_map[(n_sites, n_up, n_down, "adapt_cse_hybrid")] = {
-                "sites": n_sites,
-                "L": int(n_sites),
-                "n_up": int(n_up),
-                "n_down": int(n_down),
-                "N": int(n_up) + int(n_down),
-                "Sz": 0.5 * (int(n_up) - int(n_down)),
-                "filling": float((int(n_up) + int(n_down)) / float(n_sites)),
-                "ansatz": "adapt_cse_hybrid",
-                "energy": adapt_e,
-                "exact": exact,
-                "delta_e": adapt_e - exact,
-            }
+                    store_run_id = store.start_run(meta)
+                    logger = RunStoreLogger(store, store_run_id)
+                    status = "completed"
+                    payload: dict[str, object] = {}
+                    try:
+                        adapt_result = run_adapt(
+                            n_sites=n_sites,
+                            ferm_op=ferm_op,
+                            qubit_op=qubit_op,
+                            mapper=mapper,
+                            n_up=n_up,
+                            n_down=n_down,
+                            pool_mode="cse_density_ops",
+                            logger=logger,
+                            max_depth=settings["max_depth"],
+                            inner_steps=settings["inner_steps"],
+                            warmup_steps=settings["warmup_steps"],
+                            polish_steps=settings["polish_steps"],
+                            max_pauli_terms_measured=max_pauli_terms_measured,
+                            max_circuits_executed=max_circuits_executed,
+                            max_time_s=max_time_s,
+                            inner_steps_schedule=inner_steps_schedule,
+                        )
+                        adapt_e_final = float(adapt_result.energy)
+                        adapt_e_best = _best_energy_from_log(run_dir) or adapt_e_final
+                        adapt_e = float(adapt_e_best)
+                        # Persist for downstream reconstruction (fidelity/observables/etc).
+                        ops_out = []
+                        for op in adapt_result.operators:
+                            if isinstance(op, dict) and "name" in op:
+                                ops_out.append(str(op["name"]))
+                            else:
+                                ops_out.append(str(op))
+                        payload = {
+                            "energy": float(adapt_e_final),
+                            "best_energy": float(adapt_e_best),
+                            "theta": list(map(float, adapt_result.params)),
+                            "operators": ops_out,
+                            "pool": "cse_density_ops",
+                            "stop_reason": adapt_result.diagnostics.get("stop_reason"),
+                            "budget": {
+                                "budget_k": None if args.no_budget else float(args.budget_k),
+                                "max_pauli_terms_measured": max_pauli_terms_measured,
+                                "max_circuits_executed": max_circuits_executed,
+                                "max_time_s": max_time_s,
+                            },
+                            "exact_energy": float(exact),
+                            "sites": int(n_sites),
+                            "n_up": int(n_up),
+                            "n_down": int(n_down),
+                        }
+                    except Exception as exc:
+                        status = "error"
+                        payload = {
+                            "error": str(exc),
+                            "traceback": traceback.format_exc(),
+                            "pool": "cse_density_ops",
+                            "sites": int(n_sites),
+                            "n_up": int(n_up),
+                            "n_down": int(n_down),
+                        }
+                        raise
+                    finally:
+                        store.finish_run(store_run_id, status=status, summary_metrics=payload)
+                        # Register legacy on-disk artifacts for DB back-references.
+                        for kind, p in [
+                            ("legacy_meta_json", run_dir / "meta.json"),
+                            ("legacy_history_jsonl", run_dir / "history.jsonl"),
+                            ("legacy_result_json", run_dir / "result.json"),
+                        ]:
+                            if p.exists():
+                                store.add_artifact(
+                                    store_run_id,
+                                    kind=kind,
+                                    path=str(p),
+                                    sha256=sha256_file(p),
+                                    bytes=int(p.stat().st_size),
+                                    extra=None,
+                                )
+                row_map[(n_sites, n_up, n_down, "adapt_cse_hybrid")] = {
+                    "sites": n_sites,
+                    "L": int(n_sites),
+                    "n_up": int(n_up),
+                    "n_down": int(n_down),
+                    "N": int(n_up) + int(n_down),
+                    "Sz": 0.5 * (int(n_up) - int(n_down)),
+                    "filling": float((int(n_up) + int(n_down)) / float(n_sites)),
+                    "ansatz": "adapt_cse_hybrid",
+                    "energy": adapt_e,
+                    "exact": exact,
+                    "delta_e": adapt_e - exact,
+                }
 
-        if "adapt_uccsd_hybrid" in missing:
-            adapt_uccsd_e = None
-            if not args.force:
-                try:
-                    adapt_uccsd_e = load_cached_adapt_energy(
+            if "adapt_uccsd_hybrid" in missing:
+                adapt_uccsd_e = None
+                if not args.force:
+                    try:
+                        adapt_uccsd_e = load_cached_adapt_energy(
+                            runs_root,
+                            n_sites=n_sites,
+                            n_up=n_up,
+                            n_down=n_down,
+                            pool="uccsd_excitations",
+                        )
+                    except Exception:
+                        adapt_uccsd_e = None
+                if adapt_uccsd_e is None:
+                    settings = adapt_settings(n_sites, "uccsd_excitations")
+                    run_id = f"adapt_uccsd_{time.time_ns()}"
+                    run_dir, meta = make_adapt_run_dir(
                         runs_root,
+                        run_id=run_id,
                         n_sites=n_sites,
                         n_up=n_up,
                         n_down=n_down,
                         pool="uccsd_excitations",
-                    )
-                except Exception:
-                    adapt_uccsd_e = None
-            if adapt_uccsd_e is None:
-                settings = adapt_settings(n_sites, "uccsd_excitations")
-                run_id = f"adapt_uccsd_{int(time.time())}"
-                run_dir = make_adapt_run_dir(
-                    runs_root,
-                    run_id=run_id,
-                    n_sites=n_sites,
-                    n_up=n_up,
-                    n_down=n_down,
-                    pool="uccsd_excitations",
-                    inner_optimizer="hybrid",
-                    max_depth=settings["max_depth"],
-                    eps_grad=1e-4,
-                    eps_energy=1e-3,
-                    t=t,
-                    u=u,
-                    dv=dv,
-                    exact_energy=exact,
-                    budget_k=None if args.no_budget else float(args.budget_k),
-                    max_pauli_terms_measured=max_pauli_terms_measured,
-                    max_circuits_executed=max_circuits_executed,
-                    max_time_s=max_time_s,
-                )
-                logger = RunLogger(run_dir)
-                try:
-                    adapt_uccsd_result = run_adapt(
-                        n_sites=n_sites,
-                        ferm_op=ferm_op,
-                        qubit_op=qubit_op,
-                        mapper=mapper,
-                        n_up=n_up,
-                        n_down=n_down,
-                        pool_mode="uccsd_excitations",
-                        logger=logger,
+                        inner_optimizer="hybrid",
                         max_depth=settings["max_depth"],
-                        inner_steps=settings["inner_steps"],
-                        warmup_steps=settings["warmup_steps"],
-                        polish_steps=settings["polish_steps"],
+                        eps_grad=1e-4,
+                        eps_energy=1e-3,
+                        t=t,
+                        u=u,
+                        dv=dv,
+                        exact_energy=exact,
+                        budget_k=None if args.no_budget else float(args.budget_k),
                         max_pauli_terms_measured=max_pauli_terms_measured,
                         max_circuits_executed=max_circuits_executed,
                         max_time_s=max_time_s,
-                        inner_steps_schedule=inner_steps_schedule,
                     )
-                    adapt_uccsd_final = float(adapt_uccsd_result.energy)
-                    adapt_uccsd_best = _best_energy_from_log(run_dir) or adapt_uccsd_final
-                    adapt_uccsd_e = float(adapt_uccsd_best)
-                    ops_out = [str(op.get("name")) for op in adapt_uccsd_result.operators]
-                    payload = {
-                        "energy": float(adapt_uccsd_final),
-                        "best_energy": float(adapt_uccsd_best),
-                        "theta": list(map(float, adapt_uccsd_result.params)),
-                        "operators": ops_out,
-                        "pool": "uccsd_excitations",
-                        "stop_reason": adapt_uccsd_result.diagnostics.get("stop_reason"),
-                        "budget": {
-                            "budget_k": None if args.no_budget else float(args.budget_k),
-                            "max_pauli_terms_measured": max_pauli_terms_measured,
-                            "max_circuits_executed": max_circuits_executed,
-                            "max_time_s": max_time_s,
-                        },
-                    }
-                    (run_dir / "result.json").write_text(json.dumps(payload, indent=2, sort_keys=True))
-                finally:
-                    logger.close()
-            row_map[(n_sites, n_up, n_down, "adapt_uccsd_hybrid")] = {
-                "sites": n_sites,
-                "L": int(n_sites),
-                "n_up": int(n_up),
-                "n_down": int(n_down),
-                "N": int(n_up) + int(n_down),
-                "Sz": 0.5 * (int(n_up) - int(n_down)),
-                "filling": float((int(n_up) + int(n_down)) / float(n_sites)),
-                "ansatz": "adapt_uccsd_hybrid",
-                "energy": adapt_uccsd_e,
-                "exact": exact,
-                "delta_e": adapt_uccsd_e - exact,
-            }
-
-        if "uccsd" in missing:
-            log_dir = out_dir / f"logs_uccsd_L{n_sites}_Nup{n_up}_Ndown{n_down}"
-            cached_e = None if args.force else _best_energy_from_log(log_dir)
-            if cached_e is not None:
-                row_map[(n_sites, n_up, n_down, "uccsd")] = {
+                    store_run_id = store.start_run(meta)
+                    logger = RunStoreLogger(store, store_run_id)
+                    status = "completed"
+                    payload: dict[str, object] = {}
+                    try:
+                        adapt_uccsd_result = run_adapt(
+                            n_sites=n_sites,
+                            ferm_op=ferm_op,
+                            qubit_op=qubit_op,
+                            mapper=mapper,
+                            n_up=n_up,
+                            n_down=n_down,
+                            pool_mode="uccsd_excitations",
+                            logger=logger,
+                            max_depth=settings["max_depth"],
+                            inner_steps=settings["inner_steps"],
+                            warmup_steps=settings["warmup_steps"],
+                            polish_steps=settings["polish_steps"],
+                            max_pauli_terms_measured=max_pauli_terms_measured,
+                            max_circuits_executed=max_circuits_executed,
+                            max_time_s=max_time_s,
+                            inner_steps_schedule=inner_steps_schedule,
+                        )
+                        adapt_uccsd_final = float(adapt_uccsd_result.energy)
+                        adapt_uccsd_best = _best_energy_from_log(run_dir) or adapt_uccsd_final
+                        adapt_uccsd_e = float(adapt_uccsd_best)
+                        ops_out = []
+                        for op in adapt_uccsd_result.operators:
+                            if isinstance(op, dict) and "name" in op:
+                                ops_out.append(str(op["name"]))
+                            else:
+                                ops_out.append(str(op))
+                        payload = {
+                            "energy": float(adapt_uccsd_final),
+                            "best_energy": float(adapt_uccsd_best),
+                            "theta": list(map(float, adapt_uccsd_result.params)),
+                            "operators": ops_out,
+                            "pool": "uccsd_excitations",
+                            "stop_reason": adapt_uccsd_result.diagnostics.get("stop_reason"),
+                            "budget": {
+                                "budget_k": None if args.no_budget else float(args.budget_k),
+                                "max_pauli_terms_measured": max_pauli_terms_measured,
+                                "max_circuits_executed": max_circuits_executed,
+                                "max_time_s": max_time_s,
+                            },
+                            "exact_energy": float(exact),
+                            "sites": int(n_sites),
+                            "n_up": int(n_up),
+                            "n_down": int(n_down),
+                        }
+                    except Exception as exc:
+                        status = "error"
+                        payload = {
+                            "error": str(exc),
+                            "traceback": traceback.format_exc(),
+                            "pool": "uccsd_excitations",
+                            "sites": int(n_sites),
+                            "n_up": int(n_up),
+                            "n_down": int(n_down),
+                        }
+                        raise
+                    finally:
+                        store.finish_run(store_run_id, status=status, summary_metrics=payload)
+                        for kind, p in [
+                            ("legacy_meta_json", run_dir / "meta.json"),
+                            ("legacy_history_jsonl", run_dir / "history.jsonl"),
+                            ("legacy_result_json", run_dir / "result.json"),
+                        ]:
+                            if p.exists():
+                                store.add_artifact(
+                                    store_run_id,
+                                    kind=kind,
+                                    path=str(p),
+                                    sha256=sha256_file(p),
+                                    bytes=int(p.stat().st_size),
+                                    extra=None,
+                                )
+                row_map[(n_sites, n_up, n_down, "adapt_uccsd_hybrid")] = {
                     "sites": n_sites,
                     "L": int(n_sites),
                     "n_up": int(n_up),
@@ -1107,30 +1399,16 @@ def main() -> None:
                     "N": int(n_up) + int(n_down),
                     "Sz": 0.5 * (int(n_up) - int(n_down)),
                     "filling": float((int(n_up) + int(n_down)) / float(n_sites)),
-                    "ansatz": "uccsd",
-                    "energy": cached_e,
+                    "ansatz": "adapt_uccsd_hybrid",
+                    "energy": adapt_uccsd_e,
                     "exact": exact,
-                    "delta_e": cached_e - exact,
+                    "delta_e": adapt_uccsd_e - exact,
                 }
-            else:
-                try:
-                    e = run_regular_vqe(
-                        n_sites=n_sites,
-                        num_particles=(n_up, n_down),
-                        qubit_op=qubit_op,
-                        mapper=mapper,
-                        ansatz_kind="uccsd",
-                        exact_energy=exact,
-                        log_dir=log_dir,
-                        max_pauli_terms_measured=max_pauli_terms_measured,
-                        max_circuits_executed=max_circuits_executed,
-                        max_time_s=max_time_s,
-                        vqe_maxiter_min=int(args.vqe_maxiter_min),
-                        vqe_maxiter_per_param=int(args.vqe_maxiter_per_param),
-                        vqe_maxiter_cap=int(args.vqe_maxiter_cap),
-                        vqe_maxiter_budget_cap=int(args.vqe_maxiter_budget_cap),
-                    )
-                except Exception as exc:
+
+            if "uccsd" in missing:
+                log_dir = out_dir / f"logs_uccsd_L{n_sites}_Nup{n_up}_Ndown{n_down}"
+                cached_e = None if args.force else _best_energy_from_log(log_dir)
+                if cached_e is not None:
                     row_map[(n_sites, n_up, n_down, "uccsd")] = {
                         "sites": n_sites,
                         "L": int(n_sites),
@@ -1140,64 +1418,63 @@ def main() -> None:
                         "Sz": 0.5 * (int(n_up) - int(n_down)),
                         "filling": float((int(n_up) + int(n_down)) / float(n_sites)),
                         "ansatz": "uccsd",
-                        "energy": None,
+                        "energy": cached_e,
                         "exact": exact,
-                        "delta_e": None,
-                        "error": str(exc),
+                        "delta_e": cached_e - exact,
                     }
                 else:
-                    row_map[(n_sites, n_up, n_down, "uccsd")] = {
-                        "sites": n_sites,
-                        "L": int(n_sites),
-                        "n_up": int(n_up),
-                        "n_down": int(n_down),
-                        "N": int(n_up) + int(n_down),
-                        "Sz": 0.5 * (int(n_up) - int(n_down)),
-                        "filling": float((int(n_up) + int(n_down)) / float(n_sites)),
-                        "ansatz": "uccsd",
-                        "energy": e,
-                        "exact": exact,
-                        "delta_e": e - exact,
-                    }
+                    try:
+                        e = run_regular_vqe(
+                            n_sites=n_sites,
+                            num_particles=(n_up, n_down),
+                            qubit_op=qubit_op,
+                            mapper=mapper,
+                            ansatz_kind="uccsd",
+                            exact_energy=exact,
+                            log_dir=log_dir,
+                            max_pauli_terms_measured=max_pauli_terms_measured,
+                            max_circuits_executed=max_circuits_executed,
+                            max_time_s=max_time_s,
+                            vqe_maxiter_min=int(args.vqe_maxiter_min),
+                            vqe_maxiter_per_param=int(args.vqe_maxiter_per_param),
+                            vqe_maxiter_cap=int(args.vqe_maxiter_cap),
+                            vqe_maxiter_budget_cap=int(args.vqe_maxiter_budget_cap),
+                            store=store,
+                        )
+                    except Exception as exc:
+                        row_map[(n_sites, n_up, n_down, "uccsd")] = {
+                            "sites": n_sites,
+                            "L": int(n_sites),
+                            "n_up": int(n_up),
+                            "n_down": int(n_down),
+                            "N": int(n_up) + int(n_down),
+                            "Sz": 0.5 * (int(n_up) - int(n_down)),
+                            "filling": float((int(n_up) + int(n_down)) / float(n_sites)),
+                            "ansatz": "uccsd",
+                            "energy": None,
+                            "exact": exact,
+                            "delta_e": None,
+                            "error": str(exc),
+                        }
+                    else:
+                        row_map[(n_sites, n_up, n_down, "uccsd")] = {
+                            "sites": n_sites,
+                            "L": int(n_sites),
+                            "n_up": int(n_up),
+                            "n_down": int(n_down),
+                            "N": int(n_up) + int(n_down),
+                            "Sz": 0.5 * (int(n_up) - int(n_down)),
+                            "filling": float((int(n_up) + int(n_down)) / float(n_sites)),
+                            "ansatz": "uccsd",
+                            "energy": e,
+                            "exact": exact,
+                            "delta_e": e - exact,
+                        }
 
-        if "vqe_cse_ops" in missing:
-            log_dir = out_dir / f"logs_vqe_cse_ops_L{n_sites}_Nup{n_up}_Ndown{n_down}"
-            cached_e = None if args.force else _best_energy_from_log(log_dir)
-            if cached_e is not None:
-                row_map[(n_sites, n_up, n_down, "vqe_cse_ops")] = {
-                    "sites": n_sites,
-                    "L": int(n_sites),
-                    "n_up": int(n_up),
-                    "n_down": int(n_down),
-                    "N": int(n_up) + int(n_down),
-                    "Sz": 0.5 * (int(n_up) - int(n_down)),
-                    "filling": float((int(n_up) + int(n_down)) / float(n_sites)),
-                    "ansatz": "vqe_cse_ops",
-                    "energy": cached_e,
-                    "exact": exact,
-                    "delta_e": cached_e - exact,
-                }
-            else:
-                try:
-                    e = run_vqe_cse_ops(
-                        n_sites=n_sites,
-                        n_up=n_up,
-                        n_down=n_down,
-                        ferm_op=ferm_op,
-                        qubit_op=qubit_op,
-                        mapper=mapper,
-                        exact_energy=exact,
-                        runs_root=runs_root,
-                        log_dir=log_dir,
-                        max_pauli_terms_measured=max_pauli_terms_measured,
-                        max_circuits_executed=max_circuits_executed,
-                        max_time_s=max_time_s,
-                        vqe_maxiter_min=int(args.vqe_maxiter_min),
-                        vqe_maxiter_per_param=int(args.vqe_maxiter_per_param),
-                        vqe_maxiter_cap=int(args.vqe_maxiter_cap),
-                        vqe_maxiter_budget_cap=int(args.vqe_maxiter_budget_cap),
-                    )
-                except Exception as exc:
+            if "vqe_cse_ops" in missing:
+                log_dir = out_dir / f"logs_vqe_cse_ops_L{n_sites}_Nup{n_up}_Ndown{n_down}"
+                cached_e = None if args.force else _best_energy_from_log(log_dir)
+                if cached_e is not None:
                     row_map[(n_sites, n_up, n_down, "vqe_cse_ops")] = {
                         "sites": n_sites,
                         "L": int(n_sites),
@@ -1207,121 +1484,211 @@ def main() -> None:
                         "Sz": 0.5 * (int(n_up) - int(n_down)),
                         "filling": float((int(n_up) + int(n_down)) / float(n_sites)),
                         "ansatz": "vqe_cse_ops",
-                        "energy": None,
+                        "energy": cached_e,
                         "exact": exact,
-                        "delta_e": None,
-                        "error": str(exc),
+                        "delta_e": cached_e - exact,
                     }
                 else:
-                    row_map[(n_sites, n_up, n_down, "vqe_cse_ops")] = {
-                        "sites": n_sites,
-                        "L": int(n_sites),
-                        "n_up": int(n_up),
-                        "n_down": int(n_down),
-                        "N": int(n_up) + int(n_down),
-                        "Sz": 0.5 * (int(n_up) - int(n_down)),
-                        "filling": float((int(n_up) + int(n_down)) / float(n_sites)),
-                        "ansatz": "vqe_cse_ops",
-                        "energy": e,
-                        "exact": exact,
-                        "delta_e": e - exact,
-                    }
-
-    rows = list(row_map.values())
-    compare_path.write_text(json.dumps(rows, indent=2))
-
-    # Per-L bar charts.
-    for n_sites in sites:
-        n_up, n_down = sectors[int(n_sites)]
-        subset = [
-            r
-            for r in rows
-            if int(r.get("sites", -1)) == int(n_sites)
-            and int(r.get("n_up", -999)) == int(n_up)
-            and int(r.get("n_down", -999)) == int(n_down)
-            and r.get("delta_e") is not None
-        ]
-        if not subset:
-            continue
-        n_total = int(n_up) + int(n_down)
-        sz = 0.5 * (int(n_up) - int(n_down))
-        fill = float(n_total) / float(n_sites)
-        delta_pairs = [(str(r["ansatz"]), float(r["delta_e"])) for r in subset]
-        delta_pairs.sort(key=lambda kv: kv[1])
-        labels = [k for k, _v in delta_pairs]
-        deltas = np.array([v for _k, v in delta_pairs])
-
-        fig, ax = plt.subplots(figsize=(9, 4.6))
-        ax.bar(labels, deltas, color="#264653")
-        ax.set_ylabel("ΔE = E_ansatz - E_exact_sector")
-        ax.set_title(
-            f"Delta-E by ansatz (L={n_sites}, n_up={n_up}, n_down={n_down}, N={n_total}, Sz={sz:+.1f}, filling={fill:.3f})"
+                    try:
+                        e = run_vqe_cse_ops(
+                            n_sites=n_sites,
+                            n_up=n_up,
+                            n_down=n_down,
+                            ferm_op=ferm_op,
+                            qubit_op=qubit_op,
+                            mapper=mapper,
+                            exact_energy=exact,
+                            runs_root=runs_root,
+                            log_dir=log_dir,
+                            max_pauli_terms_measured=max_pauli_terms_measured,
+                            max_circuits_executed=max_circuits_executed,
+                            max_time_s=max_time_s,
+                            vqe_maxiter_min=int(args.vqe_maxiter_min),
+                            vqe_maxiter_per_param=int(args.vqe_maxiter_per_param),
+                            vqe_maxiter_cap=int(args.vqe_maxiter_cap),
+                            vqe_maxiter_budget_cap=int(args.vqe_maxiter_budget_cap),
+                            store=store,
+                        )
+                    except Exception as exc:
+                        row_map[(n_sites, n_up, n_down, "vqe_cse_ops")] = {
+                            "sites": n_sites,
+                            "L": int(n_sites),
+                            "n_up": int(n_up),
+                            "n_down": int(n_down),
+                            "N": int(n_up) + int(n_down),
+                            "Sz": 0.5 * (int(n_up) - int(n_down)),
+                            "filling": float((int(n_up) + int(n_down)) / float(n_sites)),
+                            "ansatz": "vqe_cse_ops",
+                            "energy": None,
+                            "exact": exact,
+                            "delta_e": None,
+                            "error": str(exc),
+                        }
+                    else:
+                        row_map[(n_sites, n_up, n_down, "vqe_cse_ops")] = {
+                            "sites": n_sites,
+                            "L": int(n_sites),
+                            "n_up": int(n_up),
+                            "n_down": int(n_down),
+                            "N": int(n_up) + int(n_down),
+                            "Sz": 0.5 * (int(n_up) - int(n_down)),
+                            "filling": float((int(n_up) + int(n_down)) / float(n_sites)),
+                            "ansatz": "vqe_cse_ops",
+                            "energy": e,
+                            "exact": exact,
+                            "delta_e": e - exact,
+                        }
+        rows = list(row_map.values())
+        compare_path.write_text(json.dumps(rows, indent=2))
+        store.add_artifact(
+            batch_run_id,
+            kind="compare_rows_json",
+            path=str(compare_path),
+            sha256=sha256_file(compare_path),
+            bytes=int(compare_path.stat().st_size),
+            extra=None,
         )
-        ax.grid(True, axis="y", alpha=0.3)
-        ax.axhline(0.0, color="black", linewidth=1.0)
-        ax.tick_params(axis="x", rotation=20)
 
-        for idx, val in enumerate(deltas):
-            ax.text(idx, val, f"{val:.3f}", ha="center", va="bottom", fontsize=8)
+        # Per-L bar charts.
+        for n_sites in sites:
+            n_up, n_down = sectors[int(n_sites)]
+            subset = [
+                r
+                for r in rows
+                if int(r.get("sites", -1)) == int(n_sites)
+                and int(r.get("n_up", -999)) == int(n_up)
+                and int(r.get("n_down", -999)) == int(n_down)
+                and r.get("delta_e") is not None
+            ]
+            if not subset:
+                continue
+            n_total = int(n_up) + int(n_down)
+            sz = 0.5 * (int(n_up) - int(n_down))
+            fill = float(n_total) / float(n_sites)
+            delta_pairs = [(str(r["ansatz"]), float(r["delta_e"])) for r in subset]
+            delta_pairs.sort(key=lambda kv: kv[1])
+            labels = [k for k, _v in delta_pairs]
+            deltas = np.array([v for _k, v in delta_pairs])
 
-        fig.tight_layout()
-        out_path = out_dir / f"delta_e_hist_L{n_sites}_Nup{n_up}_Ndown{n_down}.png"
-        fig.savefig(out_path, dpi=200)
-        plt.close(fig)
-        print(f"Saved plot to {out_path}")
+            fig, ax = plt.subplots(figsize=(9, 4.6))
+            ax.bar(labels, deltas, color="#264653")
+            ax.set_ylabel("ΔE = E_ansatz - E_exact_sector")
+            ax.set_title(
+                f"Delta-E by ansatz (L={n_sites}, n_up={n_up}, n_down={n_down}, N={n_total}, Sz={sz:+.1f}, filling={fill:.3f})"
+            )
+            ax.grid(True, axis="y", alpha=0.3)
+            ax.axhline(0.0, color="black", linewidth=1.0)
+            ax.tick_params(axis="x", rotation=20)
 
-        # Absolute error bars.
-        abs_pairs = [(str(r["ansatz"]), abs(float(r["delta_e"]))) for r in subset]
-        abs_pairs.sort(key=lambda kv: kv[1])
-        abs_labels = [k for k, _v in abs_pairs]
-        abs_vals = np.array([v for _k, v in abs_pairs])
+            for idx, val in enumerate(deltas):
+                ax.text(idx, val, f"{val:.3f}", ha="center", va="bottom", fontsize=8)
 
-        fig, ax = plt.subplots(figsize=(9, 4.6))
-        ax.bar(abs_labels, abs_vals, color="#2a9d8f")
-        ax.set_ylabel("|ΔE| = |E_ansatz - E_exact_sector|")
-        ax.set_title(
-            f"Absolute error by ansatz (L={n_sites}, n_up={n_up}, n_down={n_down}, N={n_total}, Sz={sz:+.1f}, filling={fill:.3f})"
+            fig.tight_layout()
+            out_path = out_dir / f"delta_e_hist_L{n_sites}_Nup{n_up}_Ndown{n_down}.png"
+            fig.savefig(out_path, dpi=200)
+            plt.close(fig)
+            store.add_artifact(
+                batch_run_id,
+                kind="compare_plot_png",
+                path=str(out_path),
+                sha256=sha256_file(out_path),
+                bytes=int(out_path.stat().st_size),
+                extra={"L": int(n_sites), "n_up": int(n_up), "n_down": int(n_down), "plot": "delta_e"},
+            )
+            print(f"Saved plot to {out_path}")
+
+            # Absolute error bars.
+            abs_pairs = [(str(r["ansatz"]), abs(float(r["delta_e"]))) for r in subset]
+            abs_pairs.sort(key=lambda kv: kv[1])
+            abs_labels = [k for k, _v in abs_pairs]
+            abs_vals = np.array([v for _k, v in abs_pairs])
+
+            fig, ax = plt.subplots(figsize=(9, 4.6))
+            ax.bar(abs_labels, abs_vals, color="#2a9d8f")
+            ax.set_ylabel("|ΔE| = |E_ansatz - E_exact_sector|")
+            ax.set_title(
+                f"Absolute error by ansatz (L={n_sites}, n_up={n_up}, n_down={n_down}, N={n_total}, Sz={sz:+.1f}, filling={fill:.3f})"
+            )
+            ax.grid(True, axis="y", alpha=0.3)
+            ax.tick_params(axis="x", rotation=20)
+
+            for idx, val in enumerate(abs_vals):
+                ax.text(idx, val, f"{val:.3f}", ha="center", va="bottom", fontsize=8)
+
+            fig.tight_layout()
+            out_path = out_dir / f"delta_e_abs_hist_L{n_sites}_Nup{n_up}_Ndown{n_down}.png"
+            fig.savefig(out_path, dpi=200)
+            plt.close(fig)
+            store.add_artifact(
+                batch_run_id,
+                kind="compare_plot_png",
+                path=str(out_path),
+                sha256=sha256_file(out_path),
+                bytes=int(out_path.stat().st_size),
+                extra={"L": int(n_sites), "n_up": int(n_up), "n_down": int(n_down), "plot": "abs_delta_e"},
+            )
+            print(f"Saved plot to {out_path}")
+
+            # Relative error bars.
+            exact = float(subset[0]["exact"])
+            rel_pairs = [
+                (str(r["ansatz"]), abs(float(r["delta_e"])) / abs(exact)) for r in subset
+            ]
+            rel_pairs.sort(key=lambda kv: kv[1])
+            rel_labels = [k for k, _v in rel_pairs]
+            rel_vals = np.array([v for _k, v in rel_pairs])
+
+            fig, ax = plt.subplots(figsize=(9, 4.6))
+            ax.bar(rel_labels, rel_vals, color="#e9c46a")
+            ax.set_ylabel("|ΔE| / |E_exact|")
+            ax.set_title(
+                f"Relative error by ansatz (L={n_sites}, n_up={n_up}, n_down={n_down}, N={n_total}, Sz={sz:+.1f}, filling={fill:.3f})"
+            )
+            ax.grid(True, axis="y", alpha=0.3)
+            ax.tick_params(axis="x", rotation=20)
+
+            for idx, val in enumerate(rel_vals):
+                ax.text(idx, val, f"{val:.3f}", ha="center", va="bottom", fontsize=8)
+
+            fig.tight_layout()
+            out_path = out_dir / f"delta_e_rel_hist_L{n_sites}_Nup{n_up}_Ndown{n_down}.png"
+            fig.savefig(out_path, dpi=200)
+            plt.close(fig)
+            store.add_artifact(
+                batch_run_id,
+                kind="compare_plot_png",
+                path=str(out_path),
+                sha256=sha256_file(out_path),
+                bytes=int(out_path.stat().st_size),
+                extra={"L": int(n_sites), "n_up": int(n_up), "n_down": int(n_down), "plot": "rel_delta_e"},
+            )
+            print(f"Saved plot to {out_path}")
+
+        print(f"Saved comparison rows to {compare_path}")
+        store.finish_run(
+            batch_run_id,
+            status="completed",
+            summary_metrics={
+                "rows": int(len(rows)),
+                "sites": list(map(int, sites)),
+                "out_dir": str(out_dir),
+            },
         )
-        ax.grid(True, axis="y", alpha=0.3)
-        ax.tick_params(axis="x", rotation=20)
-
-        for idx, val in enumerate(abs_vals):
-            ax.text(idx, val, f"{val:.3f}", ha="center", va="bottom", fontsize=8)
-
-        fig.tight_layout()
-        out_path = out_dir / f"delta_e_abs_hist_L{n_sites}_Nup{n_up}_Ndown{n_down}.png"
-        fig.savefig(out_path, dpi=200)
-        plt.close(fig)
-        print(f"Saved plot to {out_path}")
-
-        # Relative error bars.
-        exact = float(subset[0]["exact"])
-        rel_pairs = [
-            (str(r["ansatz"]), abs(float(r["delta_e"])) / abs(exact)) for r in subset
-        ]
-        rel_pairs.sort(key=lambda kv: kv[1])
-        rel_labels = [k for k, _v in rel_pairs]
-        rel_vals = np.array([v for _k, v in rel_pairs])
-
-        fig, ax = plt.subplots(figsize=(9, 4.6))
-        ax.bar(rel_labels, rel_vals, color="#e9c46a")
-        ax.set_ylabel("|ΔE| / |E_exact|")
-        ax.set_title(
-            f"Relative error by ansatz (L={n_sites}, n_up={n_up}, n_down={n_down}, N={n_total}, Sz={sz:+.1f}, filling={fill:.3f})"
-        )
-        ax.grid(True, axis="y", alpha=0.3)
-        ax.tick_params(axis="x", rotation=20)
-
-        for idx, val in enumerate(rel_vals):
-            ax.text(idx, val, f"{val:.3f}", ha="center", va="bottom", fontsize=8)
-
-        fig.tight_layout()
-        out_path = out_dir / f"delta_e_rel_hist_L{n_sites}_Nup{n_up}_Ndown{n_down}.png"
-        fig.savefig(out_path, dpi=200)
-        plt.close(fig)
-        print(f"Saved plot to {out_path}")
-
-    print(f"Saved comparison rows to {compare_path}")
+    except Exception as exc:
+        # Keep the batch run consistent in the DB even if a single sub-run fails.
+        try:
+            store.finish_run(
+                batch_run_id,
+                status="error",
+                summary_metrics={"error": str(exc), "traceback": traceback.format_exc()},
+            )
+        except Exception:
+            pass
+        raise
+    finally:
+        # Ensure any pending SQLite writes are flushed.
+        if hasattr(store, "close"):
+            store.close()
 
 
 if __name__ == "__main__":
